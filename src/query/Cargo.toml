@@ -1,0 +1,28 @@
+[package]
+name = "monots-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+monots-storage = { path = "../storage" }
+arrow = { workspace = true }
+parquet = { workspace = true }
+datafusion = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+futures = "0.3"
+datafusion-execution = "43"
+datafusion-physical-expr = "43"
+datafusion-common = "43"
+datafusion-physical-plan = "43"
+datafusion-physical-expr-common = "43"
+object_store = "0.11"
+chrono = "0.4"
+tokio = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+monots-stream = { path = "../stream" }

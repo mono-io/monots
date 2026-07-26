@@ -1,0 +1,164 @@
+[package]
+name = "monots-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+autotests = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+sdk = { path = "../../sdk" }
+common = { path = "../../src/common" }
+proto = { path = "../../proto" }
+monots-core = { path = "../../src/core" }
+monots-storage = { path = "../../src/storage" }
+tokio = { workspace = true }
+uuid = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+libc = "0.2"
+rdkafka = { version = "0.37", features = ["cmake-build", "tokio"] }
+object_store = { version = "0.11", features = ["aws"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+tempfile = "3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+pretty_assertions = "1"
+
+# ---------------------------------------------------------------------------
+# Integration tests live under tests/<category>/<name>.rs
+# Cargo does not auto-discover nested paths — declare each target here.
+# Run one binary:  cargo test -p monots-integration-tests --test write_dedup
+# Or category:     make -C tests/integration test-write
+# ---------------------------------------------------------------------------
+
+# --- auth ---
+[[test]]
+name = "auth_login"
+path = "tests/auth/login.rs"
+
+# --- ddl ---
+[[test]]
+name = "ddl_catalog_list"
+path = "tests/ddl/catalog_list.rs"
+
+[[test]]
+name = "ddl_catalog_advanced"
+path = "tests/ddl/catalog_advanced.rs"
+
+[[test]]
+name = "ddl_type_validation"
+path = "tests/ddl/type_validation.rs"
+
+[[test]]
+name = "ddl_time_column"
+path = "tests/ddl/time_column.rs"
+
+[[test]]
+name = "ddl_drop_table"
+path = "tests/ddl/drop_table.rs"
+
+[[test]]
+name = "ddl_complex_types"
+path = "tests/ddl/complex_types.rs"
+
+# --- write ---
+[[test]]
+name = "write_arrow_ipc"
+path = "tests/write/arrow_ipc.rs"
+
+[[test]]
+name = "write_sql_basics"
+path = "tests/write/sql_basics.rs"
+
+[[test]]
+name = "write_type_lifecycle"
+path = "tests/write/type_lifecycle.rs"
+
+[[test]]
+name = "write_types_all_sql"
+path = "tests/write/types_all_sql.rs"
+
+[[test]]
+name = "write_complex_types"
+path = "tests/write/complex_types.rs"
+
+[[test]]
+name = "write_scalar_types_extended"
+path = "tests/write/scalar_types_extended.rs"
+
+[[test]]
+name = "write_dedup"
+path = "tests/write/dedup.rs"
+
+[[test]]
+name = "write_memory_limit"
+path = "tests/write/memory_limit.rs"
+
+# --- query ---
+[[test]]
+name = "query_basic"
+path = "tests/query/basic.rs"
+
+[[test]]
+name = "query_joins"
+path = "tests/query/joins.rs"
+
+[[test]]
+name = "query_joins_advanced"
+path = "tests/query/joins_advanced.rs"
+
+[[test]]
+name = "query_subqueries"
+path = "tests/query/subqueries.rs"
+
+[[test]]
+name = "query_expressions"
+path = "tests/query/expressions.rs"
+
+[[test]]
+name = "query_aggregations"
+path = "tests/query/aggregations.rs"
+
+[[test]]
+name = "query_scalar_types"
+path = "tests/query/scalar_types.rs"
+
+[[test]]
+name = "query_case_sensitivity"
+path = "tests/query/case_sensitivity.rs"
+
+[[test]]
+name = "query_scale"
+path = "tests/query/scale.rs"
+
+# --- load ---
+[[test]]
+name = "load_parquet_bulk"
+path = "tests/load/parquet_bulk.rs"
+
+# --- stream (CDC) ---
+[[test]]
+name = "stream_filesystem_sink"
+path = "tests/stream/filesystem_sink.rs"
+
+[[test]]
+name = "stream_delta_sink"
+path = "tests/stream/delta_sink.rs"
+
+[[test]]
+name = "stream_kafka_sink"
+path = "tests/stream/kafka_sink.rs"
+
+[[test]]
+name = "stream_sql_ddl"
+path = "tests/stream/sql_ddl.rs"
+
+# --- recovery ---
+[[test]]
+name = "recovery_restart"
+path = "tests/recovery/restart.rs"

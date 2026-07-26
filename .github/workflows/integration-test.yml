@@ -1,0 +1,73 @@
+# Copyright 2026 MonoTS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Integration Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: it-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  integration-test:
+    name: monots-server + IT suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            libssl-dev \
+            libsasl2-dev \
+            protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.1
+
+      # IT builds release monots-server + debug test binaries; cache both profiles.
+      - name: Cache Rust compile artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: monots-cargo-v1
+          shared-key: it-release-debug
+          cache-targets: "true"
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Start Kafka + MinIO
+        run: make -C tests/integration docker-up
+
+      - name: Run integration tests
+        run: make integration-test
+
+      - name: Tear down Docker stack
+        if: always()
+        run: make -C tests/integration docker-down

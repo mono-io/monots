@@ -1,0 +1,24 @@
+# Rust / Cargo build output (any level, incl. nested test crates)
+target/
+
+# Runtime data & logs
+/data
+/logs
+/dist
+/meta/
+*.parquet
+.soak_data/
+
+# Local tooling / IDE / OS
+/.venv
+/.idea
+.DS_Store
+__pycache__/
+*.pyc
+
+# Profiling / benchmark artifacts
+dhat-heap.json
+*.folded
+benchmark/*.svg
+benchmark/profile-*.json
+benchmark/profile-*.json.gz

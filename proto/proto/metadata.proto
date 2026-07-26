@@ -1,0 +1,101 @@
+// Copyright 2026 MonoTS Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+package monots.meta;
+
+//! MonoTS on-disk metadata v1 (WAL + snapshot).
+//! Forward evolution: bump `store_version` and add migration; never reuse field numbers.
+
+message MetaStoreHeader {
+  uint32 magic = 1;         // 0xFDDB_META
+  uint32 store_version = 2; // v1 = 1
+  uint64 snapshot_seq = 3;
+  string persist_mode = 4;  // "durable" | "memory_only"
+}
+
+message ColumnDef {
+  string name = 1;
+  string data_type = 2;
+  bool nullable = 3;
+}
+
+message ParquetFileMeta {
+  string file_path = 1;
+  int64 min_ts = 2;
+  int64 max_ts = 3;
+  uint64 row_count = 4;
+  uint64 file_size = 5;
+  int64 creation_time_ms = 7;
+  uint32 inner_compaction_count = 8;
+  uint32 cross_compaction_count = 9;
+  // Inclusive CDC LSN range sealed into the SST filename at flush / compaction.
+  uint64 base_lsn = 10;
+  uint64 max_lsn = 11;
+}
+
+message TableSchema {
+  string table_name = 1;
+  repeated ColumnDef columns = 2;
+  string data_dir = 3;
+}
+
+message TableManifest {
+  repeated ParquetFileMeta files = 1;
+}
+
+message StoreSnapshot {
+  uint32 store_version = 1;
+  uint64 seq = 2;
+  map<string, TableSchema> schemas = 3;
+  map<string, TableManifest> manifests = 4;
+}
+
+message MetadataRecord {
+  uint64 seq = 1;
+  int64 timestamp_ms = 2;
+  oneof op {
+    PutSchema put_schema = 10;
+    SetManifest set_manifest = 11;
+    DropTable drop_table = 12;
+  }
+}
+
+message PutSchema {
+  TableSchema schema = 1;
+}
+
+message SetManifest {
+  string table = 1;
+  repeated ParquetFileMeta files = 2;
+}
+
+message DropTable {
+  string table = 1;
+}
+
+// Sync consumer progress (persisted under meta/checkpoints/{consumer}.pb).
+message SyncTableCheckpoint {
+  repeated string acked_files = 1;
+  int64 realtime_watermark_ts = 2;
+  reserved 3; // was rows_synced
+  string last_acked_file = 4;
+  int64 last_updated_ms = 5;
+}
+
+message SyncConsumerCheckpoint {
+  string consumer_id = 1;
+  map<string, SyncTableCheckpoint> tables = 2;
+  int64 updated_at_ms = 3;
+}

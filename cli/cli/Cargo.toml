@@ -1,0 +1,20 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "monots"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../../src/common" }
+sdk = { path = "../../sdk" }
+monots-core = { path = "../../src/core" }
+proto = { path = "../../proto" }
+clap = { workspace = true }
+rustyline = { workspace = true }
+comfy-table = { workspace = true }
+tokio = { workspace = true }
+arrow = { workspace = true }

@@ -1,0 +1,32 @@
+[package]
+name = "monots-benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "monots-bench"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../src/common" }
+monots-core = { path = "../src/core" }
+monots-catalog = { path = "../src/catalog" }
+monots-storage = { path = "../src/storage" }
+arrow = { workspace = true }
+clap = { workspace = true }
+comfy-table = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tempfile = "3"
+sysinfo = { workspace = true }
+parking_lot = { workspace = true }
+dhat = { version = "0.3", optional = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
+[features]
+# Enable heap allocation profiling (writes dhat-heap.json on exit).
+dhat-heap = ["dep:dhat"]

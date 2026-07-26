@@ -1,0 +1,44 @@
+[package]
+name = "monots-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "monots_stream"
+path = "src/lib.rs"
+
+[dependencies]
+common = { path = "../common" }
+monots-catalog = { path = "../catalog" }
+monots-storage = { path = "../storage" }
+proto = { path = "../../proto" }
+arrow = { workspace = true }
+arrow-json = "53"
+parquet = { workspace = true }
+datafusion = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+prost = { workspace = true }
+crc32fast = { workspace = true }
+futures = "0.3"
+rdkafka = { version = "0.37", features = ["cmake-build", "tokio"] }
+# Arrow-53 compatible deltalake; FunctionStream uses 0.32 (Arrow 55).
+# `s3` enables official s3:// / MinIO handlers (requires rustc >= 1.94.1 — see rust-toolchain.toml).
+deltalake = { version = "0.22.3", default-features = false, features = ["s3"] }
+object_store = { version = "0.11", features = ["aws"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["kafka", "delta"]
+kafka = []
+delta = []

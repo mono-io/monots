@@ -1,0 +1,75 @@
+# Copyright 2026 MonoTS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Unit Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ut-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  unit-test:
+    name: license · fmt · cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            libssl-dev \
+            libsasl2-dev \
+            protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt
+
+      # Cache ~/.cargo + target/ (deps + compile artifacts).
+      # PRs restore from main; only main/master writes a new cache entry.
+      - name: Cache Rust compile artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: monots-cargo-v1
+          shared-key: ut-debug
+          cache-targets: "true"
+          cache-all-crates: "true"
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Check license headers
+        run: make check-license
+
+      - name: Check Rust formatting
+        run: make fmt-check
+
+      - name: Run unit tests
+        run: make test

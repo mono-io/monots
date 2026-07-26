@@ -1,0 +1,46 @@
+[package]
+name = "monots-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "monots_core"
+path = "src/lib.rs"
+
+[dependencies]
+common = { path = "../common" }
+proto = { path = "../../proto" }
+monots-catalog = { path = "../catalog" }
+monots-stream = { path = "../stream" }
+monots-storage = { path = "../storage" }
+monots-query = { path = "../query" }
+prost = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+datafusion = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+futures = "0.3"
+
+[[test]]
+name = "query_count"
+path = "tests/query_count.rs"
+
+[[test]]
+name = "query_large_count"
+path = "tests/query_large_count.rs"
+
+[[test]]
+name = "write_batch_sort"
+path = "tests/write_batch_sort.rs"

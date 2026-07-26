@@ -1,0 +1,4 @@
+# deltalake `s3` feature (deltalake-aws / aws-sdk) requires rustc >= 1.94.1.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

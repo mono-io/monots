@@ -1,0 +1,85 @@
+# MonoTS edge time-series database configuration
+#
+# Dist layout (after `make dist-host`):
+#   monots-<version>/
+#   ├── bin/monots-server, monots, start-server.sh, start-cli.sh
+#   ├── conf/config.yaml    <-- this file
+#   ├── data/               runtime data (created on start)
+#   └── logs/               server logs (daemon mode)
+#
+# Override config path:
+#   ./bin/start-server.sh -c /path/to/config.yaml
+
+service:
+  host: "0.0.0.0"
+  port: 50051
+  data_dir: data
+  username: admin
+  password: admin
+
+logging:
+  # Global default: info | warn | error | debug | trace
+  # info = info + warn + error (production default)
+  level: info
+  # Per-module overrides (optional):
+  # modules:
+  #   monots_storage: debug   # compaction / flush / WAL
+  #   monots_core: info
+  #   monots_catalog: warn
+  #   monots_query: warn
+  format: pretty   # pretty | json
+  directory: logs
+  file_name: monots.log
+  console: true
+  file: true
+  ansi: true
+  line_number: false
+  target: true
+  rotation: daily  # hourly | daily | never
+
+storage:
+  memtable_max_bytes: 67108864
+  # MemTable micro-batch rows (BatchBuffer seal capacity). Default 1024.
+  # 512 = lower latency / smaller chunks; 2048–4096 = fewer seals under bulk ingest.
+  memtable_batch_max_rows: 1024
+  memtable_batch_max_bytes: 1048576
+  # Hard cap (100%): writes are rejected when global memtable memory reaches this limit.
+  global_memory_limit_bytes: 536870912
+  # Soft threshold (0.0–1.0): proactively flush the largest memtable when usage hits this ratio.
+  global_memory_soft_threshold_ratio: 0.5
+  metadata_memory_limit_bytes: 16777216
+  # Max on-disk size of one WAL file before rotating (100 MiB).
+  wal_segment_max_bytes: 104857600
+  # Max size of one WAL block/frame = header + body (5 MiB).
+  wal_block_max_bytes: 5242880
+  wal_micro_batch_max_bytes: 2097152
+  wal_global_backlog_max_bytes: 67108864
+  wal_table_backlog_max_bytes: 2097152
+  compaction_threshold_bytes: 134217728
+  compaction_interval_secs: 60
+  # File-selection strategy (always merges a CONTIGUOUS run of files):
+  #   size_tiered (default) - longest under-threshold run, fewest resulting files
+  #   file_count            - longest run of small files (cuts read amplification)
+  #   overlap               - run with most timestamp overlap (max dedup reclaim)
+  compaction_strategy: size_tiered
+  # Max number of contiguous files collapsed into one SST per merge.
+  compaction_max_merge_files: 8
+  # Global cap on merge jobs running at once across all tables (disk IO throttle).
+  compaction_max_concurrent_jobs: 4
+  # Sorted-flush window size (rows) when timestamps need reordering / dedupe.
+  flush_window_rows: 8192
+  # Parquet row-group size for SST writes.
+  sst_max_row_group_size: 8192
+
+sync:
+  queue_size: 1000
+  max_pending_acks: 8
+  realtime_poll_ms: 50
+  # Total CDC live-Arrow budget (MemTable memory tier). When full, capture uses disk WAL/Shadow
+  # without blocking writers. Separate from storage.global_memory_limit_bytes (memtables).
+  live_arrow_memory_limit_bytes: 67108864   # 64 MiB
+  live_arrow_channel_capacity: 1024
+  # Sealed WAL frame cache (archives / finished segments) for disk-tier catch-up.
+  wal_load_cache_max_bytes: 33554432        # 32 MiB
+  lake_endpoint: ""
+  lake_bucket: monots

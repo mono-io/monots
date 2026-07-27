@@ -30,6 +30,15 @@ make build-host
 make run-server
 ```
 
+Or run with Docker:
+
+```bash
+# Build image and start via Compose (http://127.0.0.1:50051)
+make docker-up
+
+# Or: docker build -t monots:latest . && docker compose up -d
+```
+
 ### 2. Connect and Query
 
 Open a new terminal and launch the interactive CLI:

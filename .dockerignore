@@ -1,0 +1,31 @@
+# Git / IDE / local tooling
+.git
+.github
+.idea
+.venv
+.DS_Store
+**/.DS_Store
+
+# Build & runtime artifacts
+target
+dist
+data
+logs
+meta
+.soak_data
+*.parquet
+dhat-heap.json
+*.folded
+
+# Benchmark / profile noise
+benchmark/*.svg
+benchmark/profile-*.json
+benchmark/profile-*.json.gz
+
+# Docs assets are not needed for the image binary
+docs
+
+# Docker / compose (avoid self-copy noise in build context)
+Dockerfile*
+docker-compose*.yml
+.dockerignore

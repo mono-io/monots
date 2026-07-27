@@ -29,7 +29,10 @@ reqwest = { workspace = true }
 prost = { workspace = true }
 crc32fast = { workspace = true }
 futures = "0.3"
-rdkafka = { version = "0.37", features = ["cmake-build", "tokio"] }
+# `curl` is required: librdkafka 2.12.x (via rdkafka-sys 4.10) still includes
+# curl/curl.h when WITH_CURL=0 due to an `#ifdef WITH_OAUTHBEARER_OIDC` bug.
+# See https://github.com/fede1024/rust-rdkafka/issues/829
+rdkafka = { version = "0.37", features = ["cmake-build", "tokio", "curl"] }
 # Arrow-53 compatible deltalake; FunctionStream uses 0.32 (Arrow 55).
 # `s3` enables official s3:// / MinIO handlers (requires rustc >= 1.94.1 — see rust-toolchain.toml).
 deltalake = { version = "0.22.3", default-features = false, features = ["s3"] }

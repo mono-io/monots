@@ -17,6 +17,8 @@ SERVER_CRATE := server
 CLI_CRATE    := cli
 SERVER_BIN   := monots-server
 CLI_BIN      := monots
+DOCKER_IMAGE ?= monots:latest
+DOCKER_PORT  ?= 50051
 
 # Version from root `[workspace.package]` (single source of truth).
 VERSION      := $(shell grep '^version' Cargo.toml | head -1 | awk -F '"' '{print $$2}')
@@ -67,7 +69,9 @@ C_0 := \033[0m
 log = @printf "$(C_B)[-]$(C_0) %-15s %s\n" "$(1)" "$(2)"
 success = @printf "$(C_G)[✔]$(C_0) %s\n" "$(1)"
 
-.PHONY: all help build build-host dev test integration-test clean dist run-server run-cli fmt fmt-check check check-license .check-env .ensure-target
+.PHONY: all help build build-host dev test integration-test clean dist run-server run-cli \
+	docker-build docker-run docker-up docker-down fmt fmt-check check check-license \
+	.check-env .ensure-target
 
 all: build-host
 
@@ -86,6 +90,10 @@ help:
 	@echo "  fmt-check   cargo fmt --check (CI)"
 	@echo "  run-server  Start server via scripts/start-server.sh (host build)"
 	@echo "  run-cli     Start interactive CLI"
+	@echo "  docker-build  Build Docker image ($(DOCKER_IMAGE))"
+	@echo "  docker-run    Run container (port $(DOCKER_PORT), named volume for data)"
+	@echo "  docker-up     docker compose up -d --build"
+	@echo "  docker-down   docker compose down"
 	@echo "  clean       Remove build artifacts, dist, data, logs"
 	@echo ""
 	@echo "  Version: $(VERSION) | Arch: $(ARCH) | OS: $(OS)"
@@ -185,6 +193,29 @@ run-server: build-host
 run-cli: build-host
 	$(call log,RUN,start-cli.sh)
 	@./scripts/start-cli.sh
+
+docker-build:
+	$(call log,DOCKER,build $(DOCKER_IMAGE))
+	@docker build -t $(DOCKER_IMAGE) .
+	$(call success,Image: $(DOCKER_IMAGE))
+
+docker-run: docker-build
+	$(call log,DOCKER,run $(DOCKER_IMAGE) :$(DOCKER_PORT))
+	@docker run --rm --name monots \
+		-p $(DOCKER_PORT):50051 \
+		-v monots-data:/opt/monots/data \
+		-v monots-logs:/opt/monots/logs \
+		$(DOCKER_IMAGE)
+
+docker-up:
+	$(call log,DOCKER,compose up)
+	@docker compose up -d --build
+	$(call success,Listening on http://127.0.0.1:$(DOCKER_PORT))
+
+docker-down:
+	$(call log,DOCKER,compose down)
+	@docker compose down
+	$(call success,Stopped)
 
 clean:
 	$(call log,CLEAN,Removing artifacts)

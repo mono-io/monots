@@ -46,6 +46,7 @@ jobs:
             pkg-config \
             libssl-dev \
             libsasl2-dev \
+            libcurl4-openssl-dev \
             protobuf-compiler
 
       - name: Install Rust toolchain

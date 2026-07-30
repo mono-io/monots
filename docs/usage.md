@@ -72,7 +72,7 @@ CREATE STREAM metrics_out WITH (
 
 SHOW STREAMS;
 SHOW STREAM STATUS FOR metrics_out;
-DROP STREAM metrics_out WITH CHECKPOINT;
+DROP STREAM metrics_out;
 ```
 
 ### Essential Sink Properties

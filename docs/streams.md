@@ -28,9 +28,8 @@ SHOW STREAMS;
 SHOW STREAM <name>;
 SHOW STREAM STATUS FOR <name>;
 
--- Removal
+-- Removal (also deletes recovery / checkpoint state)
 DROP STREAM <name>;
-DROP STREAM <name> WITH CHECKPOINT; -- Also permanently deletes recovery state
 ```
 
 ---

@@ -223,7 +223,7 @@ impl StreamStore {
         Ok(())
     }
 
-    pub async fn remove(&self, name: &str, delete_checkpoint: bool) -> Result<()> {
+    pub async fn remove(&self, name: &str) -> Result<()> {
         let lock_arc = self.get_name_lock(name);
         let _guard = lock_arc.lock().await;
 
@@ -243,11 +243,9 @@ impl StreamStore {
         }
         self.sync_directory(&self.root).await?;
 
-        if delete_checkpoint {
-            // Checkpoint identity is always `stream::<name>` (see stream_worker_id).
-            let worker = format!("stream::{name}");
-            self.checkpoints.delete(name, &worker).await?;
-        }
+        // Checkpoint identity is always `stream::<name>` (see stream_worker_id).
+        let worker = format!("stream::{name}");
+        self.checkpoints.delete(name, &worker).await?;
 
         drop(_guard);
         drop(lock_arc);

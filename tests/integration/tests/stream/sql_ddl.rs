@@ -68,10 +68,7 @@ async fn create_show_drop_stream_lifecycle() {
     );
     assert_eq!(scalar_str_named(&status, "cdc_mode"), "batch");
 
-    client
-        .no_query("DROP STREAM metrics_out WITH CHECKPOINT")
-        .await
-        .unwrap();
+    client.no_query("DROP STREAM metrics_out").await.unwrap();
     let empty = client.query("SHOW STREAMS").await.unwrap();
     assert_eq!(empty[0].num_rows(), 0);
 }

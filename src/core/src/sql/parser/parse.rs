@@ -116,19 +116,7 @@ fn parse_create_stream(parser: &mut Parser) -> Result<MonotsStatement, ParserErr
 fn parse_drop_stream(parser: &mut Parser) -> Result<MonotsStatement, ParserError> {
     expect_word(parser, "STREAM")?;
     let name = parser.parse_object_name(false)?.to_string();
-    let delete_checkpoint = word_matches(parser, "WITH")
-        && {
-            parser.next_token();
-            word_matches(parser, "CHECKPOINT")
-        }
-        && {
-            parser.next_token();
-            true
-        };
-    Ok(MonotsStatement::DropStream(DropStreamStmt {
-        name,
-        delete_checkpoint,
-    }))
+    Ok(MonotsStatement::DropStream(DropStreamStmt { name }))
 }
 
 fn parse_show(parser: &mut Parser) -> Result<MonotsStatement, ParserError> {

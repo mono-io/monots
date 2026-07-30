@@ -148,7 +148,7 @@ pub async fn create_stream(
                 "Failed to allocate stream runtime, rolling back metadata"
             );
             let _ = teardown_stream_runtime(&def, rt_ctx, storage, orchestrator).await;
-            let _ = ctx.streams.remove(&name, true).await;
+            let _ = ctx.streams.remove(&name).await;
             return Err(e);
         }
 
@@ -164,11 +164,7 @@ pub async fn create_stream(
     Ok(StreamMutatingOutcome::Created { name })
 }
 
-pub async fn drop_stream(
-    ctx: &StreamDdlContext,
-    name: String,
-    delete_checkpoint: bool,
-) -> Result<StreamMutatingOutcome> {
+pub async fn drop_stream(ctx: &StreamDdlContext, name: String) -> Result<StreamMutatingOutcome> {
     let def = ctx
         .streams
         .get(&name)
@@ -182,7 +178,7 @@ pub async fn drop_stream(
         }
     }
 
-    ctx.streams.remove(&name, delete_checkpoint).await?;
+    ctx.streams.remove(&name).await?;
     info!(stream = %name, "Stream successfully dropped");
     Ok(StreamMutatingOutcome::Dropped { name })
 }

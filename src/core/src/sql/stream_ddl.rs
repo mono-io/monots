@@ -63,7 +63,7 @@ pub async fn execute_mutating(ctx: &StreamDdlContext, sql: &str) -> Result<Strea
             let MonotsStatement::DropStream(drop) = stmt else {
                 return Err(TsdbError::Query("internal: expected DropStream".into()));
             };
-            drop_stream(ctx, drop.name, drop.delete_checkpoint).await
+            drop_stream(ctx, drop.name).await
         }
         other => Err(TsdbError::Query(format!(
             "{other:?} is a query statement; use the Query API"

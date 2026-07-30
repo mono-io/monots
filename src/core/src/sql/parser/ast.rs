@@ -25,7 +25,6 @@ pub struct CreateStreamStmt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropStreamStmt {
     pub name: String,
-    pub delete_checkpoint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

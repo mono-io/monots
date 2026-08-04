@@ -41,6 +41,11 @@ const REMOVED_DELTA_OPTION_KEYS: &[&str] = &[
     "delta.deletedFileRetentionDuration",
 ];
 
+/// DDL key prefix for Delta S3 client options.
+pub const DELTA_OPTION_PREFIX: &str = "sink.delta";
+/// DDL key prefix for Filesystem S3 client options (same knobs, different namespace).
+pub const FILESYSTEM_OPTION_PREFIX: &str = "sink.filesystem";
+
 /// DDL / property keys owned by the Delta sink.
 pub const DELTA_OPTION_KEYS: &[&str] = &[
     "sink.delta.access.key",
@@ -50,6 +55,17 @@ pub const DELTA_OPTION_KEYS: &[&str] = &[
     "sink.delta.connection.maximum",
     "sink.delta.connection.timeout",
     "sink.delta.attempts.maximum",
+];
+
+/// DDL / property keys owned by the Filesystem sink (S3 client knobs).
+pub const FILESYSTEM_OPTION_KEYS: &[&str] = &[
+    "sink.filesystem.access.key",
+    "sink.filesystem.secret.key",
+    "sink.filesystem.region",
+    "sink.filesystem.path.style.access",
+    "sink.filesystem.connection.maximum",
+    "sink.filesystem.connection.timeout",
+    "sink.filesystem.attempts.maximum",
 ];
 
 /// Strongly-typed Delta sink knobs with industrial defaults always applied.
@@ -83,32 +99,51 @@ impl Default for DeltaSinkOptions {
 }
 
 impl DeltaSinkOptions {
-    /// Fill from DDL options; missing keys keep industrial defaults.
+    /// Fill from Delta DDL options; missing keys keep industrial defaults.
     pub fn from_ddl(options: &HashMap<String, String>) -> Result<Self> {
-        reject_removed_keys(options)?;
+        Self::from_ddl_prefixed(DELTA_OPTION_PREFIX, options)
+    }
+
+    /// Fill from Filesystem DDL options (`sink.filesystem.*` S3 client knobs).
+    pub fn from_filesystem_ddl(options: &HashMap<String, String>) -> Result<Self> {
+        Self::from_ddl_prefixed(FILESYSTEM_OPTION_PREFIX, options)
+    }
+
+    /// Fill from DDL / properties using `{prefix}.access.key` etc.
+    pub fn from_ddl_prefixed(prefix: &str, options: &HashMap<String, String>) -> Result<Self> {
+        if prefix == DELTA_OPTION_PREFIX {
+            reject_removed_keys(options)?;
+        }
 
         let mut opts = Self::default();
+        let access = format!("{prefix}.access.key");
+        let secret = format!("{prefix}.secret.key");
+        let region = format!("{prefix}.region");
+        let path_style = format!("{prefix}.path.style.access");
+        let conn_max = format!("{prefix}.connection.maximum");
+        let conn_timeout = format!("{prefix}.connection.timeout");
+        let attempts = format!("{prefix}.attempts.maximum");
 
-        if let Some(v) = non_empty(options, "sink.delta.access.key") {
+        if let Some(v) = non_empty(options, &access) {
             opts.access_key = Some(v.to_string());
         }
-        if let Some(v) = non_empty(options, "sink.delta.secret.key") {
+        if let Some(v) = non_empty(options, &secret) {
             opts.secret_key = Some(v.to_string());
         }
-        if let Some(v) = non_empty(options, "sink.delta.region") {
+        if let Some(v) = non_empty(options, &region) {
             opts.region = v.to_string();
         }
-        if let Some(v) = non_empty(options, "sink.delta.path.style.access") {
+        if let Some(v) = non_empty(options, &path_style) {
             opts.path_style_access = Some(parse_bool(v)?);
         }
-        if let Some(v) = non_empty(options, "sink.delta.connection.maximum") {
-            opts.connection_maximum = parse_u32(v, "sink.delta.connection.maximum")?;
+        if let Some(v) = non_empty(options, &conn_max) {
+            opts.connection_maximum = parse_u32(v, &conn_max)?;
         }
-        if let Some(v) = non_empty(options, "sink.delta.connection.timeout") {
-            opts.connection_timeout_ms = parse_duration_ms(v, "sink.delta.connection.timeout")?;
+        if let Some(v) = non_empty(options, &conn_timeout) {
+            opts.connection_timeout_ms = parse_duration_ms(v, &conn_timeout)?;
         }
-        if let Some(v) = non_empty(options, "sink.delta.attempts.maximum") {
-            opts.attempts_maximum = parse_u32(v, "sink.delta.attempts.maximum")?;
+        if let Some(v) = non_empty(options, &attempts) {
+            opts.attempts_maximum = parse_u32(v, &attempts)?;
         }
 
         Ok(opts)
@@ -119,30 +154,39 @@ impl DeltaSinkOptions {
         Self::from_ddl(props)
     }
 
+    /// Restore filesystem options from protobuf `properties`.
+    pub fn from_filesystem_properties(props: &HashMap<String, String>) -> Result<Self> {
+        Self::from_filesystem_ddl(props)
+    }
+
     /// Flatten into protobuf / SHOW CREATE property pairs (always full set).
     /// Credentials are only included when explicitly set (never invent placeholders).
     pub fn to_properties(&self) -> HashMap<String, String> {
+        self.to_properties_prefixed(DELTA_OPTION_PREFIX)
+    }
+
+    pub fn to_properties_prefixed(&self, prefix: &str) -> HashMap<String, String> {
         let mut m = HashMap::new();
         if let Some(k) = &self.access_key {
-            m.insert("sink.delta.access.key".into(), k.clone());
+            m.insert(format!("{prefix}.access.key"), k.clone());
         }
         if let Some(k) = &self.secret_key {
-            m.insert("sink.delta.secret.key".into(), k.clone());
+            m.insert(format!("{prefix}.secret.key"), k.clone());
         }
-        m.insert("sink.delta.region".into(), self.region.clone());
+        m.insert(format!("{prefix}.region"), self.region.clone());
         if let Some(ps) = self.path_style_access {
-            m.insert("sink.delta.path.style.access".into(), bool_str(ps).into());
+            m.insert(format!("{prefix}.path.style.access"), bool_str(ps).into());
         }
         m.insert(
-            "sink.delta.connection.maximum".into(),
+            format!("{prefix}.connection.maximum"),
             self.connection_maximum.to_string(),
         );
         m.insert(
-            "sink.delta.connection.timeout".into(),
+            format!("{prefix}.connection.timeout"),
             format_duration_ms(self.connection_timeout_ms),
         );
         m.insert(
-            "sink.delta.attempts.maximum".into(),
+            format!("{prefix}.attempts.maximum"),
             self.attempts_maximum.to_string(),
         );
         m
@@ -150,31 +194,39 @@ impl DeltaSinkOptions {
 
     /// Ordered key/value pairs for `CREATE STREAM … WITH` formatting.
     pub fn ddl_pairs(&self, endpoint: Option<&str>) -> Vec<(String, String)> {
+        self.ddl_pairs_prefixed(DELTA_OPTION_PREFIX, endpoint)
+    }
+
+    pub fn ddl_pairs_prefixed(
+        &self,
+        prefix: &str,
+        endpoint: Option<&str>,
+    ) -> Vec<(String, String)> {
         let mut pairs = Vec::new();
         if let Some(k) = &self.access_key {
-            pairs.push(("sink.delta.access.key".into(), k.clone()));
+            pairs.push((format!("{prefix}.access.key"), k.clone()));
         }
         if let Some(k) = &self.secret_key {
-            pairs.push(("sink.delta.secret.key".into(), k.clone()));
+            pairs.push((format!("{prefix}.secret.key"), k.clone()));
         }
-        pairs.push(("sink.delta.region".into(), self.region.clone()));
+        pairs.push((format!("{prefix}.region"), self.region.clone()));
         let path_style = self
             .path_style_access
             .unwrap_or_else(|| endpoint.map(|e| !e.is_empty()).unwrap_or(false));
         pairs.push((
-            "sink.delta.path.style.access".into(),
+            format!("{prefix}.path.style.access"),
             bool_str(path_style).into(),
         ));
         pairs.push((
-            "sink.delta.connection.maximum".into(),
+            format!("{prefix}.connection.maximum"),
             self.connection_maximum.to_string(),
         ));
         pairs.push((
-            "sink.delta.connection.timeout".into(),
+            format!("{prefix}.connection.timeout"),
             format_duration_ms(self.connection_timeout_ms),
         ));
         pairs.push((
-            "sink.delta.attempts.maximum".into(),
+            format!("{prefix}.attempts.maximum"),
             self.attempts_maximum.to_string(),
         ));
         pairs

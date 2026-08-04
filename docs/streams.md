@@ -84,21 +84,54 @@ CREATE STREAM metrics_delta WITH (
 
 ## Sink: Kafka (`sink.type = 'kafka'`)
 
-Pushes change events as row-level messages to a Kafka topic.
+Pushes change events as row-level JSON messages to a Kafka topic (librdkafka producer).
 
-- **Default `cdc.mode`:** `hybrid` (Streams both historical Parquet rows and live WAL inserts).
-- **Default `sink.format`:** `json` (Currently the only supported format).
+- **Default `cdc.mode`:** `hybrid` (historical Parquet + live WAL inserts).
+- **Default `sink.format`:** `json` (only supported value format).
+- **Default delivery:** `at-least-once` (`acks=all` + idempotent producer). Set `exactly-once` to enable Kafka transactions.
 
-| Property             | Description                                                     |
-|----------------------|-----------------------------------------------------------------|
-| `sink.kafka.brokers` | Comma-separated list of Kafka brokers (e.g., `127.0.0.1:9092`). |
-| `sink.kafka.topic`   | The destination topic name.                                     |
+| Property | Default | Description |
+|----------|---------|-------------|
+| `sink.kafka.brokers` | *(required)* | Comma-separated brokers (`bootstrap.servers`). |
+| `sink.kafka.topic` | *(required)* | Destination topic. |
+| `sink.kafka.key.format` | — | Key serialization; only `json` when keys are enabled. |
+| `sink.kafka.key.fields` | — | Comma-separated columns used as the Kafka message key. |
+| `sink.kafka.key.fields-prefix` | `""` | Prefix applied to key JSON field names (e.g. `k_`). |
+| `sink.kafka.partitioner` | `default` | `default` (key hash) \| `round-robin` \| `fixed` (partition 0). |
+| `sink.kafka.delivery-guarantee` | `at-least-once` | `at-least-once` \| `exactly-once`. |
+| `sink.kafka.transactional.id` | `monots-stream-<name>` | Required identity for EOS (auto-derived if omitted). |
+| `sink.kafka.transaction.timeout.ms` | `900000` | Must be ≤ broker `transaction.max.timeout.ms`. |
+| `sink.kafka.compression.type` | librdkafka default | e.g. `lz4`, `zstd`, `snappy`, `gzip`, `none`. |
+| `sink.kafka.batch.size` | librdkafka default | Producer batch size (bytes). |
+| `sink.kafka.linger.ms` | librdkafka default | Max wait before sending a batch. |
+| `sink.kafka.acks` | `all` | Forced to `all` under exactly-once. |
+| `sink.kafka.retries` | librdkafka default | Producer retries. |
+| `sink.kafka.security.protocol` | — | `PLAINTEXT` / `SSL` / `SASL_PLAINTEXT` / `SASL_SSL`. |
+| `sink.kafka.sasl.mechanism` | — | e.g. `PLAIN`, `SCRAM-SHA-256`. |
+| `sink.kafka.sasl.username` / `password` | — | Preferred over JAAS when set. |
+| `sink.kafka.sasl.jaas.config` | — | Flink-style JAAS; parsed into username/password for librdkafka. |
+| `sink.kafka.ssl.ca.location` | — | PEM CA bundle (also accepts `ssl.truststore.location` as alias). |
+| `sink.kafka.ssl.certificate.location` / `ssl.key.location` | — | Client PEM cert/key (mTLS). |
+| `sink.kafka.ssl.keystore.location` / `password` | — | PKCS#12 client keystore (librdkafka). |
+
+> **Note:** MonoTS uses **librdkafka**, not the JVM client. Java JKS truststores are not loaded as JKS — point `ssl.ca.location` / `ssl.truststore.location` at a **PEM** CA file. Prefer `sasl.username` / `sasl.password` over JAAS when possible.
 
 ```sql
 CREATE STREAM metrics_kafka WITH (
   'sink.type' = 'kafka',
   'sink.kafka.brokers' = '127.0.0.1:9092',
   'sink.kafka.topic' = 'metrics-cdc',
+  'sink.kafka.key.format' = 'json',
+  'sink.kafka.key.fields' = 'order_id',
+  'sink.kafka.key.fields-prefix' = 'k_',
+  'sink.kafka.partitioner' = 'default',
+  'sink.kafka.delivery-guarantee' = 'exactly-once',
+  'sink.kafka.transaction.timeout.ms' = '900000',
+  'sink.kafka.compression.type' = 'lz4',
+  'sink.kafka.batch.size' = '65536',
+  'sink.kafka.linger.ms' = '20',
+  'sink.kafka.acks' = 'all',
+  'sink.kafka.retries' = '10',
   'source.table' = 'metrics'
 );
 ```
@@ -107,19 +140,43 @@ CREATE STREAM metrics_kafka WITH (
 
 ## Sink: Filesystem (`sink.type = 'filesystem'` or `'fs'`)
 
-Exports raw Parquet files to a local directory. Guarantees file integrity via atomic renames.
+Exports raw Parquet files (no `_delta_log`). Supports the same storage URIs as Delta:
+
+- local paths (e.g. `/data/export/metrics`)
+- `file://…`
+- `s3://` / `s3a://` (MinIO via `sink.filesystem.endpoint`)
+
+Local commits use atomic rename (`.tmp` → `.parquet`). Object-store commits stage locally then stream-upload finalized Parquet keys.
 
 - **Default `cdc.mode`:** `batch`
 - **Default `sink.format`:** `parquet`
 
-| Property               | Description                                             |
-|------------------------|---------------------------------------------------------|
-| `sink.filesystem.path` | Local output directory for the generated Parquet files. |
+| Property | Default | Description |
+|----------|---------|-------------|
+| `sink.filesystem.path` | *(required)* | Output directory / URI. Supports local paths, `file://`, `s3://`, and `s3a://`. |
+| `sink.filesystem.endpoint` | *(optional)* | Custom S3-compatible API endpoint (e.g. MinIO). |
+| `sink.filesystem.access.key` / `secret.key` | *(optional)* | Explicit credentials; otherwise default AWS chain / env. |
+| `sink.filesystem.region` | `us-east-1` | S3 region. |
+| `sink.filesystem.path.style.access` | auto (`true` if endpoint set) | Path-style addressing. |
+| `sink.filesystem.connection.maximum` | `500` | Max concurrent object-store connections (upload concurrency is capped). |
+| `sink.filesystem.connection.timeout` | `200s` | Connect / request timeout (SQL duration). |
+| `sink.filesystem.attempts.maximum` | `20` | Request retry budget. |
 
 ```sql
 CREATE STREAM metrics_fs WITH (
   'sink.type' = 'filesystem',
   'sink.filesystem.path' = '/data/export/metrics',
+  'source.table' = 'metrics'
+);
+```
+
+```sql
+CREATE STREAM metrics_fs_s3 WITH (
+  'sink.type' = 'filesystem',
+  'sink.filesystem.path' = 's3://lake/export/metrics',
+  'sink.filesystem.endpoint' = 'http://127.0.0.1:9000',
+  'sink.filesystem.access.key' = 'minioadmin',
+  'sink.filesystem.secret.key' = 'minioadmin',
   'source.table' = 'metrics'
 );
 ```

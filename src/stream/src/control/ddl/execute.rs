@@ -347,12 +347,33 @@ pub fn format_stream_ddl(def: &StreamDef) -> String {
                 parts.push(format!("'{k}' = '{v}'"));
             }
         }
-        crate::model::SinkConfig::Filesystem { path } => {
+        crate::model::SinkConfig::Filesystem {
+            path,
+            endpoint,
+            options,
+        } => {
             parts.push(format!("'sink.filesystem.path' = '{path}'"));
+            if let Some(ep) = endpoint.as_ref().filter(|s| !s.is_empty()) {
+                parts.push(format!("'sink.filesystem.endpoint' = '{ep}'"));
+            }
+            for (k, v) in options.ddl_pairs_prefixed(
+                crate::model::delta_options::FILESYSTEM_OPTION_PREFIX,
+                endpoint.as_deref(),
+            ) {
+                parts.push(format!("'{k}' = '{v}'"));
+            }
         }
-        crate::model::SinkConfig::Kafka { brokers, topic, .. } => {
+        crate::model::SinkConfig::Kafka {
+            brokers,
+            topic,
+            options,
+            ..
+        } => {
             parts.push(format!("'sink.kafka.brokers' = '{brokers}'"));
             parts.push(format!("'sink.kafka.topic' = '{topic}'"));
+            for (k, v) in options.ddl_pairs() {
+                parts.push(format!("'{k}' = '{v}'"));
+            }
         }
     }
     if def.auto_end {

@@ -40,10 +40,23 @@ pub fn build_sink_with_engine(
             brokers,
             topic,
             format,
+            options,
+            stream_name,
         } => {
             let format = PayloadFormat::from_str_name(&format)
                 .map_err(|e| common::TsdbError::Query(e.to_string()))?;
-            let mut sink = KafkaSink::new(brokers, topic, format);
+            let mut sink = KafkaSink::new(brokers, topic, format, options);
+            if matches!(
+                sink.delivery_guarantee(),
+                crate::model::KafkaDeliveryGuarantee::ExactlyOnce
+            ) {
+                let txn_id = sink
+                    .options()
+                    .transactional_id
+                    .clone()
+                    .unwrap_or_else(|| format!("monots-stream-{stream_name}"));
+                sink = sink.with_exactly_once(txn_id);
+            }
             if let Some(engine) = engine {
                 if let Ok(loader) =
                     StreamArrowLoader::from_engine(engine, def.source_tables[0].as_str())
@@ -53,9 +66,14 @@ pub fn build_sink_with_engine(
             }
             Ok(Box::new(sink))
         }
-        ResolvedSinkConfig::Filesystem { path, table } => {
-            Ok(Box::new(FilesystemSink::new(path, table)))
-        }
+        ResolvedSinkConfig::Filesystem {
+            path,
+            table,
+            endpoint,
+            options,
+        } => Ok(Box::new(FilesystemSink::new(
+            path, table, endpoint, options,
+        ))),
         ResolvedSinkConfig::Delta {
             path,
             table,
@@ -82,6 +100,7 @@ mod tests {
                 brokers: "b:9092".into(),
                 topic: "cdc".into(),
                 format: "json".into(),
+                options: crate::model::KafkaSinkOptions::default(),
             },
             created_at_ms: 0,
             auto_end: false,
@@ -91,6 +110,8 @@ mod tests {
         let fs = StreamDef {
             sink_config: SinkConfig::Filesystem {
                 path: "/tmp/out".into(),
+                endpoint: None,
+                options: crate::model::DeltaSinkOptions::default(),
             },
             capture_mode: common::StreamCaptureMode::Batch,
             ..kafka.clone()

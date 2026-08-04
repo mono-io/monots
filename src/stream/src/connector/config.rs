@@ -14,8 +14,6 @@
 
 //! Resolved physical sink configuration and DDL validation.
 
-use std::path::PathBuf;
-
 use common::{ConnectorType, Result, StreamCaptureMode, TsdbError};
 
 use crate::model::StreamDef;
@@ -26,10 +24,17 @@ pub enum ResolvedSinkConfig {
         brokers: String,
         topic: String,
         format: String,
+        options: crate::model::KafkaSinkOptions,
+        /// Used to derive transactional.id when EOS is enabled and id is omitted.
+        stream_name: String,
     },
     Filesystem {
-        path: PathBuf,
+        /// Local path or object URI (`s3://…`, `file://…`, …). Kept as String so
+        /// schemes like `s3://` are not mangled by [`PathBuf`].
+        path: String,
         table: Option<String>,
+        endpoint: Option<String>,
+        options: crate::model::DeltaSinkOptions,
     },
     Delta {
         /// Local path or object URI (`s3://…`, `file://…`, …). Kept as String so
@@ -54,19 +59,33 @@ impl ResolvedSinkConfig {
                         "Kafka requires sink.kafka.brokers and sink.kafka.topic".into(),
                     ));
                 }
+                let options = match &def.sink_config {
+                    crate::model::SinkConfig::Kafka { options, .. } => options.clone(),
+                    _ => crate::model::KafkaSinkOptions::default(),
+                };
                 Ok(Self::Kafka {
                     brokers: brokers.to_string(),
                     topic: topic.to_string(),
                     format: cfg.delivery_format().to_string(),
+                    options,
+                    stream_name: def.name.clone(),
                 })
             }
             ConnectorType::Filesystem => {
                 let path = cfg.sink_path().filter(|s| !s.is_empty()).ok_or_else(|| {
                     TsdbError::Query("filesystem sink requires sink.filesystem.path".into())
                 })?;
+                let (endpoint, options) = match &def.sink_config {
+                    crate::model::SinkConfig::Filesystem {
+                        endpoint, options, ..
+                    } => (endpoint.clone(), options.clone()),
+                    _ => (None, crate::model::DeltaSinkOptions::default()),
+                };
                 Ok(Self::Filesystem {
-                    path: PathBuf::from(path),
+                    path: path.to_string(),
                     table: def.source_tables.first().cloned(),
+                    endpoint,
+                    options,
                 })
             }
             ConnectorType::Delta => {
@@ -109,7 +128,7 @@ pub fn connector_default_format(connector: ConnectorType) -> &'static str {
 
 fn supported_formats(connector: ConnectorType) -> &'static [&'static str] {
     match connector {
-        ConnectorType::Kafka => &["json", "avro"],
+        ConnectorType::Kafka => &["json"],
         ConnectorType::Delta | ConnectorType::Filesystem => &["parquet"],
     }
 }
@@ -141,6 +160,7 @@ mod tests {
                 brokers: "localhost:9092".into(),
                 topic: "topic".into(),
                 format: "json".into(),
+                options: crate::model::KafkaSinkOptions::default(),
             },
             ConnectorType::Delta => SinkConfig::Delta {
                 path: "/tmp/lake".into(),
@@ -149,6 +169,8 @@ mod tests {
             },
             ConnectorType::Filesystem => SinkConfig::Filesystem {
                 path: "/tmp/fs".into(),
+                endpoint: None,
+                options: crate::model::DeltaSinkOptions::default(),
             },
         };
         StreamDef {

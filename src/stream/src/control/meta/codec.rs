@@ -170,6 +170,7 @@ impl TryFrom<proto::stream::StreamDef> for StreamDef {
                 brokers: pb.kafka_brokers.unwrap_or_default(),
                 topic: pb.kafka_topic.unwrap_or_default(),
                 format: pb.delivery_format,
+                options: crate::model::KafkaSinkOptions::from_properties(&pb.properties)?,
             },
             ConnectorType::Delta => SinkConfig::Delta {
                 path: pb.sink_path.unwrap_or_default(),
@@ -178,6 +179,10 @@ impl TryFrom<proto::stream::StreamDef> for StreamDef {
             },
             ConnectorType::Filesystem => SinkConfig::Filesystem {
                 path: pb.sink_path.unwrap_or_default(),
+                endpoint: pb.sink_endpoint.filter(|s| !s.is_empty()),
+                options: crate::model::DeltaSinkOptions::from_filesystem_properties(
+                    &pb.properties,
+                )?,
             },
         };
         Ok(Self {
@@ -207,10 +212,12 @@ impl From<&StreamDef> for proto::stream::StreamDef {
             from_timestamp: 0,
             to_timestamp: None,
             auto_end: def.auto_end,
-            properties: def
-                .delta_options()
-                .map(|o| o.to_properties())
-                .unwrap_or_default(),
+            properties: match &def.sink_config {
+                crate::model::SinkConfig::Delta { options, .. } => options.to_properties(),
+                crate::model::SinkConfig::Filesystem { options, .. } => options
+                    .to_properties_prefixed(crate::model::delta_options::FILESYSTEM_OPTION_PREFIX),
+                crate::model::SinkConfig::Kafka { options, .. } => options.to_properties(),
+            },
             created_at_ms: def.created_at_ms,
             sink_endpoint: def.sink_endpoint().map(|s| s.to_string()),
         }
@@ -432,5 +439,34 @@ mod tests {
         let decoded = decode_stream_checkpoint(&bytes).unwrap();
         assert_eq!(decoded.stream_name, "s1");
         assert_eq!(decoded.tables["t0"].acked_lsn, 9);
+    }
+
+    #[test]
+    fn kafka_options_roundtrip_on_wire() {
+        let mut options = crate::model::KafkaSinkOptions::default();
+        options.key_format = Some("json".into());
+        options.key_fields = vec!["order_id".into()];
+        options.key_fields_prefix = "k_".into();
+        options.delivery_guarantee = crate::model::KafkaDeliveryGuarantee::ExactlyOnce;
+        options.compression_type = Some("lz4".into());
+        options.transaction_timeout_ms = Some(900_000);
+
+        let bytes = encode_stream_def(&StreamDef {
+            sink_config: SinkConfig::Kafka {
+                brokers: "b:9092".into(),
+                topic: "orders".into(),
+                format: "json".into(),
+                options,
+            },
+            ..sample()
+        })
+        .unwrap();
+        let v = decode_versioned_stream_def(&bytes).unwrap();
+        let o = v.inner.kafka_options().unwrap();
+        assert_eq!(o.key_fields, vec!["order_id".to_string()]);
+        assert_eq!(o.key_fields_prefix, "k_");
+        assert_eq!(o.delivery_guarantee.as_str(), "exactly-once");
+        assert_eq!(o.compression_type.as_deref(), Some("lz4"));
+        assert_eq!(o.transaction_timeout_ms, Some(900_000));
     }
 }

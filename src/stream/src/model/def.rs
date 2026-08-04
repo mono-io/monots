@@ -16,7 +16,8 @@
 
 use common::{ConnectorType, Result, StreamCaptureMode, TsdbError};
 
-use super::delta_options::{DeltaSinkOptions, DELTA_OPTION_KEYS};
+use super::delta_options::{DeltaSinkOptions, DELTA_OPTION_KEYS, FILESYSTEM_OPTION_KEYS};
+use super::kafka_options::{KafkaSinkOptions, KAFKA_OPTION_KEYS};
 
 /// Pure stream configuration (persisted in `streams/*.pb`).
 #[derive(Debug, Clone)]
@@ -37,6 +38,7 @@ pub enum SinkConfig {
         brokers: String,
         topic: String,
         format: String,
+        options: KafkaSinkOptions,
     },
     Delta {
         path: String,
@@ -44,8 +46,13 @@ pub enum SinkConfig {
         /// Industrial S3 / table-property defaults (always filled on parse).
         options: DeltaSinkOptions,
     },
-    /// Local directory export of CDC Parquet files.
-    Filesystem { path: String },
+    /// Parquet directory export (local / `file://` / `s3://` / `s3a://`).
+    Filesystem {
+        path: String,
+        endpoint: Option<String>,
+        /// S3 client knobs when `path` is an object URI (same industrial defaults as Delta).
+        options: DeltaSinkOptions,
+    },
 }
 
 impl SinkConfig {
@@ -66,7 +73,7 @@ impl SinkConfig {
 
     pub fn sink_path(&self) -> Option<&str> {
         match self {
-            Self::Delta { path, .. } | Self::Filesystem { path } => Some(path.as_str()),
+            Self::Delta { path, .. } | Self::Filesystem { path, .. } => Some(path.as_str()),
             Self::Kafka { .. } => None,
         }
     }
@@ -85,9 +92,19 @@ impl SinkConfig {
         }
     }
 
+    pub fn kafka_options(&self) -> Option<&KafkaSinkOptions> {
+        match self {
+            Self::Kafka { options, .. } => Some(options),
+            _ => None,
+        }
+    }
+
     pub fn sink_endpoint(&self) -> Option<&str> {
         match self {
             Self::Delta {
+                endpoint: Some(ep), ..
+            }
+            | Self::Filesystem {
                 endpoint: Some(ep), ..
             } if !ep.is_empty() => Some(ep.as_str()),
             _ => None,
@@ -96,7 +113,7 @@ impl SinkConfig {
 
     pub fn delta_options(&self) -> Option<&DeltaSinkOptions> {
         match self {
-            Self::Delta { options, .. } => Some(options),
+            Self::Delta { options, .. } | Self::Filesystem { options, .. } => Some(options),
             _ => None,
         }
     }
@@ -127,6 +144,10 @@ impl StreamDef {
         self.sink_config.kafka_topic()
     }
 
+    pub fn kafka_options(&self) -> Option<&KafkaSinkOptions> {
+        self.sink_config.kafka_options()
+    }
+
     pub fn sink_endpoint(&self) -> Option<&str> {
         self.sink_config.sink_endpoint()
     }
@@ -150,15 +171,18 @@ impl StreamDef {
         }
     }
 
-    /// Fill Delta `sink.delta.endpoint` from a process-wide default when the stream omitted it.
-    /// Stream DDL (`sink.delta.endpoint`) always wins.
+    /// Fill lake/object-store endpoint from a process-wide default when the stream omitted it.
+    /// Stream DDL (`sink.delta.endpoint` / `sink.filesystem.endpoint`) always wins.
     pub fn with_lake_endpoint(mut self, endpoint: Option<String>) -> Self {
-        if let SinkConfig::Delta { endpoint: e, .. } = &mut self.sink_config {
-            if e.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-                if let Some(ep) = endpoint.filter(|s| !s.is_empty()) {
-                    *e = Some(ep);
+        match &mut self.sink_config {
+            SinkConfig::Delta { endpoint: e, .. } | SinkConfig::Filesystem { endpoint: e, .. } => {
+                if e.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                    if let Some(ep) = endpoint.filter(|s| !s.is_empty()) {
+                        *e = Some(ep);
+                    }
                 }
             }
+            _ => {}
         }
         self
     }
@@ -217,7 +241,7 @@ fn reject_foreign_sink_keys(
     reject_legacy_keys(options)?;
 
     let delta_keys = ["sink.delta.path", "sink.delta.endpoint"];
-    let fs_keys = ["sink.filesystem.path"];
+    let fs_keys = ["sink.filesystem.path", "sink.filesystem.endpoint"];
     let kafka_keys = ["sink.kafka.brokers", "sink.kafka.topic"];
 
     let bad = match connector {
@@ -226,8 +250,14 @@ fn reject_foreign_sink_keys(
             if has_any_key(options, &fs_keys) {
                 v.extend_from_slice(&fs_keys);
             }
+            if has_any_key(options, FILESYSTEM_OPTION_KEYS) {
+                v.extend_from_slice(FILESYSTEM_OPTION_KEYS);
+            }
             if has_any_key(options, &kafka_keys) {
                 v.extend_from_slice(&kafka_keys);
+            }
+            if has_any_key(options, KAFKA_OPTION_KEYS) {
+                v.extend_from_slice(KAFKA_OPTION_KEYS);
             }
             v
         }
@@ -242,6 +272,9 @@ fn reject_foreign_sink_keys(
             if has_any_key(options, &kafka_keys) {
                 v.extend_from_slice(&kafka_keys);
             }
+            if has_any_key(options, KAFKA_OPTION_KEYS) {
+                v.extend_from_slice(KAFKA_OPTION_KEYS);
+            }
             v
         }
         ConnectorType::Kafka => {
@@ -254,6 +287,9 @@ fn reject_foreign_sink_keys(
             }
             if has_any_key(options, &fs_keys) {
                 v.extend_from_slice(&fs_keys);
+            }
+            if has_any_key(options, FILESYSTEM_OPTION_KEYS) {
+                v.extend_from_slice(FILESYSTEM_OPTION_KEYS);
             }
             v
         }
@@ -338,6 +374,7 @@ pub fn parse_stream_def(
                 brokers,
                 topic,
                 format: delivery_format,
+                options: KafkaSinkOptions::from_ddl(options)?,
             }
         }
         ConnectorType::Delta => {
@@ -358,7 +395,13 @@ pub fn parse_stream_def(
                     TsdbError::Query("filesystem sink requires sink.filesystem.path".into())
                 })?
                 .to_string();
-            SinkConfig::Filesystem { path }
+            let endpoint = opt_keyed(options, &["sink.filesystem.endpoint"]).map(|s| s.to_string());
+            let fs_opts = DeltaSinkOptions::from_filesystem_ddl(options)?;
+            SinkConfig::Filesystem {
+                path,
+                endpoint,
+                options: fs_opts,
+            }
         }
     };
 
@@ -560,6 +603,54 @@ mod tests {
         .unwrap();
         assert_eq!(def.capture_mode, StreamCaptureMode::Hybrid);
         assert_eq!(def.delivery_format(), "json");
+        let o = def.kafka_options().unwrap();
+        assert_eq!(o.delivery_guarantee.as_str(), "at-least-once");
+        assert_eq!(o.partitioner.as_str(), "default");
+    }
+
+    #[test]
+    fn kafka_full_flink_style_options_parse() {
+        let def = parse_stream_def(
+            "orders".into(),
+            &opts(&[
+                ("sink.type", "kafka"),
+                ("source.table", "t"),
+                ("sink.kafka.brokers", "kafka-broker1:9093,kafka-broker2:9093"),
+                ("sink.kafka.topic", "dwd_order_events"),
+                ("sink.format", "json"),
+                ("sink.kafka.key.format", "json"),
+                ("sink.kafka.key.fields", "order_id"),
+                ("sink.kafka.key.fields-prefix", "k_"),
+                ("sink.kafka.partitioner", "default"),
+                ("sink.kafka.delivery-guarantee", "exactly-once"),
+                ("sink.kafka.transaction.timeout.ms", "900000"),
+                ("sink.kafka.compression.type", "lz4"),
+                ("sink.kafka.batch.size", "65536"),
+                ("sink.kafka.linger.ms", "20"),
+                ("sink.kafka.acks", "all"),
+                ("sink.kafka.retries", "10"),
+                ("sink.kafka.security.protocol", "SASL_SSL"),
+                ("sink.kafka.sasl.mechanism", "PLAIN"),
+                (
+                    "sink.kafka.sasl.jaas.config",
+                    r#"org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="your_password";"#,
+                ),
+                ("sink.kafka.ssl.truststore.location", "/opt/certs/ca.pem"),
+                ("sink.kafka.ssl.keystore.location", "/opt/certs/client.p12"),
+                ("sink.kafka.ssl.keystore.password", "keystore_password"),
+            ]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(def.sink_path(), None);
+        assert_eq!(def.kafka_topic(), Some("dwd_order_events"));
+        let o = def.kafka_options().unwrap();
+        assert_eq!(o.key_fields, vec!["order_id".to_string()]);
+        assert_eq!(o.key_fields_prefix, "k_");
+        assert_eq!(o.delivery_guarantee.as_str(), "exactly-once");
+        assert_eq!(o.compression_type.as_deref(), Some("lz4"));
+        assert_eq!(o.sasl_username.as_deref(), Some("admin"));
+        assert_eq!(o.ssl_ca_location.as_deref(), Some("/opt/certs/ca.pem"));
     }
 
     #[test]
@@ -750,6 +841,28 @@ mod tests {
             err.contains("sink.path") || err.contains("sink.endpoint"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn filesystem_s3_ddl_parses_client_options() {
+        let def = parse_stream_def(
+            "s".into(),
+            &opts(&[
+                ("sink.type", "filesystem"),
+                ("source.table", "t"),
+                ("sink.filesystem.path", "s3a://bucket/export"),
+                ("sink.filesystem.endpoint", "http://127.0.0.1:9000"),
+                ("sink.filesystem.region", "us-west-2"),
+                ("sink.filesystem.connection.timeout", "3 min"),
+            ]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(def.sink_path(), Some("s3a://bucket/export"));
+        assert_eq!(def.sink_endpoint(), Some("http://127.0.0.1:9000"));
+        let opts = def.delta_options().expect("fs options");
+        assert_eq!(opts.region, "us-west-2");
+        assert_eq!(opts.connection_timeout_ms, 180_000);
     }
 
     #[test]

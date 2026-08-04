@@ -14,6 +14,7 @@
 
 //! Physical sink plugins — one module per connector protocol.
 
+pub(crate) mod object_uri;
 mod parquet_dir;
 
 pub mod delta;

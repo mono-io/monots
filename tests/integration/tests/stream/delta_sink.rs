@@ -236,11 +236,24 @@ async fn delta_local_flush_1k_write_queryable() -> Result<(), Box<dyn std::error
 
     let stats = recv_client
         .query(&format!(
-            "SELECT COUNT(*) AS c, SUM(value) AS s, MIN(value) AS vmin, MAX(value) AS vmax \
-             FROM {receiver}"
+            "SELECT COUNT(*) AS c, SUM(value) AS s, MIN(value) AS vmin, MAX(value) AS vmax, \
+             COUNT(DISTINCT value) AS d FROM {receiver}"
         ))
         .await?;
     assert_data_stats(&stats);
+    assert_eq!(
+        scalar_i64_named(&stats, "d"),
+        TOTAL_ROWS as i64,
+        "distinct values must cover full range"
+    );
+
+    let regions = recv_client
+        .query(&format!(
+            "SELECT region, COUNT(*) AS c FROM {receiver} GROUP BY region ORDER BY region"
+        ))
+        .await?;
+    // ORDER BY region → east first
+    assert_eq!(scalar_i64_named(&regions, "c"), TOTAL_ROWS as i64 / 2);
 
     Ok(())
 }

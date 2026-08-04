@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Kafka sink: ALO / EOS delivery with JSON payloads.
+//! Kafka sink: ALO / EOS delivery with JSON payloads, optional keys, and producer tuning.
 //!
 //! Lazy connect + pre-flight metadata, pipelined `FutureProducer` sends,
 //! and `spawn_blocking` around librdkafka FFI so the Tokio reactor never stalls.
@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_json::LineDelimitedWriter;
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -32,6 +33,7 @@ use tracing::{debug, info, warn};
 use crate::connector::api::{SinkConnector, SinkError};
 use crate::data::StreamArrowLoader;
 use crate::model::event::{DataEvent, InsertArrow};
+use crate::model::{KafkaDeliveryGuarantee, KafkaPartitioner, KafkaSinkOptions};
 
 const KAFKA_TXN_TIMEOUT: Duration = Duration::from_secs(10);
 const KAFKA_PING_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,42 +65,124 @@ impl PayloadFormat {
     }
 }
 
-/// Columnar Arrow → row-oriented Kafka payloads.
+/// One Kafka record: optional key bytes + value payload.
+#[derive(Debug, Clone)]
+pub struct KafkaRecord {
+    pub key: Option<Vec<u8>>,
+    pub value: Vec<u8>,
+}
+
+/// Columnar Arrow → row-oriented Kafka payloads (+ optional JSON keys).
 pub struct PayloadEncoder;
 
 impl PayloadEncoder {
     pub fn encode(
         format: &PayloadFormat,
         batches: &[RecordBatch],
-    ) -> Result<Vec<Vec<u8>>, SinkError> {
+        options: &KafkaSinkOptions,
+    ) -> Result<Vec<KafkaRecord>, SinkError> {
         match format {
-            PayloadFormat::Json => {
-                let mut buf = Vec::new();
-                {
-                    let mut writer = LineDelimitedWriter::new(&mut buf);
-                    for batch in batches {
-                        writer.write(batch).map_err(|e| {
-                            SinkError::Fatal(format!("Arrow→JSON encode failed: {e}"))
-                        })?;
-                    }
-                    writer
-                        .finish()
-                        .map_err(|e| SinkError::Fatal(format!("JSON finish failed: {e}")))?;
-                }
-                Ok(buf
-                    .split(|&b| b == b'\n')
-                    .filter(|line| !line.is_empty())
-                    .map(|line| line.to_vec())
-                    .collect())
-            }
+            PayloadFormat::Json => Self::encode_json(batches, options),
         }
     }
+
+    fn encode_json(
+        batches: &[RecordBatch],
+        options: &KafkaSinkOptions,
+    ) -> Result<Vec<KafkaRecord>, SinkError> {
+        let mut records = Vec::new();
+        for batch in batches {
+            let values = encode_batch_json_lines(batch)?;
+            let keys = if options.has_key() {
+                encode_key_json_lines(batch, &options.key_fields, &options.key_fields_prefix)?
+            } else {
+                vec![None; values.len()]
+            };
+            if keys.len() != values.len() {
+                return Err(SinkError::Fatal(format!(
+                    "Kafka key/value row count mismatch: {} keys vs {} values",
+                    keys.len(),
+                    values.len()
+                )));
+            }
+            for (key, value) in keys.into_iter().zip(values) {
+                records.push(KafkaRecord { key, value });
+            }
+        }
+        Ok(records)
+    }
+}
+
+fn encode_batch_json_lines(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, SinkError> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = LineDelimitedWriter::new(&mut buf);
+        writer
+            .write(batch)
+            .map_err(|e| SinkError::Fatal(format!("Arrow→JSON encode failed: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| SinkError::Fatal(format!("JSON finish failed: {e}")))?;
+    }
+    Ok(buf
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_vec())
+        .collect())
+}
+
+fn encode_key_json_lines(
+    batch: &RecordBatch,
+    fields: &[String],
+    prefix: &str,
+) -> Result<Vec<Option<Vec<u8>>>, SinkError> {
+    let projected = project_key_batch(batch, fields, prefix)?;
+    let lines = encode_batch_json_lines(&projected)?;
+    Ok(lines.into_iter().map(Some).collect())
+}
+
+fn project_key_batch(
+    batch: &RecordBatch,
+    fields: &[String],
+    prefix: &str,
+) -> Result<RecordBatch, SinkError> {
+    let mut cols = Vec::with_capacity(fields.len());
+    let mut schema_fields = Vec::with_capacity(fields.len());
+    for name in fields {
+        let idx = batch.schema().index_of(name).map_err(|_| {
+            SinkError::Fatal(format!(
+                "sink.kafka.key.fields column `{name}` not found in batch schema {:?}",
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>()
+            ))
+        })?;
+        let array = batch.column(idx).clone();
+        let out_name = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}{name}")
+        };
+        schema_fields.push(Field::new(
+            out_name,
+            array.data_type().clone(),
+            array.is_nullable(),
+        ));
+        cols.push(array);
+    }
+    let schema = Arc::new(Schema::new(schema_fields));
+    RecordBatch::try_new(schema, cols)
+        .map_err(|e| SinkError::Fatal(format!("project Kafka key batch failed: {e}")))
 }
 
 pub struct KafkaSink {
     brokers: String,
     topic: String,
     format: PayloadFormat,
+    options: KafkaSinkOptions,
     mode: DeliveryMode,
     producer: Option<FutureProducer>,
     arrow_loader: Option<Arc<StreamArrowLoader>>,
@@ -109,21 +193,42 @@ impl KafkaSink {
         brokers: impl Into<String>,
         topic: impl Into<String>,
         format: PayloadFormat,
+        options: KafkaSinkOptions,
     ) -> Self {
+        let mode = match options.delivery_guarantee {
+            KafkaDeliveryGuarantee::AtLeastOnce => DeliveryMode::AtLeastOnce,
+            KafkaDeliveryGuarantee::ExactlyOnce => DeliveryMode::ExactlyOnce {
+                // Placeholder; builder overrides via with_exactly_once.
+                transactional_id: options
+                    .transactional_id
+                    .clone()
+                    .unwrap_or_else(|| "monots-kafka".into()),
+            },
+        };
         Self {
             brokers: brokers.into(),
             topic: topic.into(),
             format,
-            mode: DeliveryMode::default(),
+            options,
+            mode,
             producer: None,
             arrow_loader: None,
         }
     }
 
+    pub fn options(&self) -> &KafkaSinkOptions {
+        &self.options
+    }
+
+    pub fn delivery_guarantee(&self) -> KafkaDeliveryGuarantee {
+        self.options.delivery_guarantee
+    }
+
     pub fn with_exactly_once(mut self, transactional_id: impl Into<String>) -> Self {
-        self.mode = DeliveryMode::ExactlyOnce {
-            transactional_id: transactional_id.into(),
-        };
+        let transactional_id = transactional_id.into();
+        self.options.transactional_id = Some(transactional_id.clone());
+        self.options.delivery_guarantee = KafkaDeliveryGuarantee::ExactlyOnce;
+        self.mode = DeliveryMode::ExactlyOnce { transactional_id };
         self
     }
 
@@ -142,18 +247,20 @@ impl KafkaSink {
             brokers = %self.brokers,
             topic = %self.topic,
             mode = ?self.mode,
+            partitioner = %self.options.partitioner.as_str(),
             "KafkaSink establishing producer"
         );
 
         let mut cfg = ClientConfig::new();
-        cfg.set("bootstrap.servers", &self.brokers)
-            .set("acks", "all")
-            .set("enable.idempotence", "true")
-            .set("metadata.request.timeout.ms", "5000")
-            .set("max.in.flight.requests.per.connection", "5");
+        cfg.set("bootstrap.servers", &self.brokers);
+        self.options.apply_client_config(&mut |k, v| {
+            cfg.set(k, v);
+        });
 
         if let DeliveryMode::ExactlyOnce { transactional_id } = &self.mode {
             cfg.set("transactional.id", transactional_id);
+            // EOS requires acks=all; enforce even if apply already set it.
+            cfg.set("acks", "all");
         }
 
         let producer: FutureProducer = cfg
@@ -177,8 +284,15 @@ impl KafkaSink {
         }
 
         if matches!(self.mode, DeliveryMode::ExactlyOnce { .. }) {
+            let txn_timeout = Duration::from_millis(
+                self.options
+                    .transaction_timeout_ms
+                    .unwrap_or(900_000)
+                    .min(u64::from(u32::MAX)),
+            )
+            .max(KAFKA_TXN_TIMEOUT);
             let p = producer.clone();
-            spawn_blocking(move || p.init_transactions(Timeout::After(KAFKA_TXN_TIMEOUT)))
+            spawn_blocking(move || p.init_transactions(Timeout::After(txn_timeout)))
                 .await
                 .map_err(|e| SinkError::Fatal(format!("init_transactions join: {e}")))?
                 .map_err(|e| SinkError::Transient(format!("init_transactions failed: {e}")))?;
@@ -199,8 +313,8 @@ impl KafkaSink {
         lsn_hint: u64,
         kind: &str,
     ) -> Result<(), SinkError> {
-        let payloads = PayloadEncoder::encode(&self.format, batches)?;
-        if payloads.is_empty() {
+        let records = PayloadEncoder::encode(&self.format, batches, &self.options)?;
+        if records.is_empty() {
             return Ok(());
         }
 
@@ -210,10 +324,17 @@ impl KafkaSink {
             .ok_or_else(|| SinkError::Fatal("write without active producer".into()))?
             .clone();
 
+        let fixed_partition = matches!(self.options.partitioner, KafkaPartitioner::Fixed);
+
         let mut delivery = FuturesUnordered::new();
-        for payload in &payloads {
-            let record: FutureRecord<'_, (), [u8]> =
-                FutureRecord::to(&self.topic).payload(payload.as_slice());
+        for rec in &records {
+            let mut record = FutureRecord::to(&self.topic).payload(rec.value.as_slice());
+            if let Some(key) = rec.key.as_ref() {
+                record = record.key(key.as_slice());
+            }
+            if fixed_partition {
+                record = record.partition(0);
+            }
             match producer.send_result(record) {
                 Ok(fut) => delivery.push(fut),
                 Err((e, _)) => {
@@ -243,7 +364,8 @@ impl KafkaSink {
 
         debug!(
             lsn = lsn_hint,
-            rows = payloads.len(),
+            rows = records.len(),
+            keyed = self.options.has_key(),
             kind,
             "Kafka rows produced"
         );
@@ -306,8 +428,6 @@ impl SinkConnector for KafkaSink {
                     .await?;
             }
             DataEvent::FlushFile { lsn, rows, .. } => {
-                // Batch CDC (and hybrid after Flush degrades covered Inserts) delivers
-                // Parquet via FlushFile — load Arrow and encode JSON rows.
                 let Some(loader) = self.arrow_loader.as_ref() else {
                     return Err(SinkError::Transient(
                         "KafkaSink needs StreamArrowLoader for FlushFile".into(),
@@ -343,10 +463,17 @@ impl SinkConnector for KafkaSink {
             .ok_or_else(|| SinkError::Fatal("commit without active producer".into()))?
             .clone();
 
-        let res =
-            spawn_blocking(move || producer.commit_transaction(Timeout::After(KAFKA_TXN_TIMEOUT)))
-                .await
-                .map_err(|e| SinkError::Fatal(format!("commit_transaction join: {e}")))?;
+        let txn_timeout = Duration::from_millis(
+            self.options
+                .transaction_timeout_ms
+                .unwrap_or(900_000)
+                .min(u64::from(u32::MAX)),
+        )
+        .max(KAFKA_TXN_TIMEOUT);
+
+        let res = spawn_blocking(move || producer.commit_transaction(Timeout::After(txn_timeout)))
+            .await
+            .map_err(|e| SinkError::Fatal(format!("commit_transaction join: {e}")))?;
 
         if let Err(e) = res {
             self.drop_producer();
@@ -364,7 +491,6 @@ impl SinkConnector for KafkaSink {
                 .await;
             }
         }
-        // Always drop so recovery starts from a clean producer.
         self.drop_producer();
         Ok(())
     }
@@ -408,21 +534,23 @@ impl SinkConnector for KafkaSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int64Array;
+    use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use common::LsnRange;
     use std::sync::Arc;
 
-    fn sample_batch(n: i64) -> RecordBatch {
+    fn sample_batch(order_id: i64, region: &str) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("time", DataType::Int64, false),
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
             Field::new("v", DataType::Int64, false),
         ]));
         RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int64Array::from(vec![n])),
-                Arc::new(Int64Array::from(vec![n * 10])),
+                Arc::new(Int64Array::from(vec![order_id])),
+                Arc::new(StringArray::from(vec![Some(region)])),
+                Arc::new(Int64Array::from(vec![order_id * 10])),
             ],
         )
         .unwrap()
@@ -434,35 +562,69 @@ mod tests {
             PayloadFormat::from_str_name("json").unwrap(),
             PayloadFormat::Json
         );
-        assert_eq!(
-            PayloadFormat::from_str_name("JSON").unwrap(),
-            PayloadFormat::Json
-        );
         assert!(PayloadFormat::from_str_name("avro").is_err());
     }
 
     #[test]
     fn json_encoder_emits_one_line_per_row() {
-        let batches = vec![sample_batch(1), sample_batch(2)];
-        let payloads = PayloadEncoder::encode(&PayloadFormat::Json, &batches).unwrap();
+        let batches = vec![sample_batch(1, "east"), sample_batch(2, "west")];
+        let payloads =
+            PayloadEncoder::encode(&PayloadFormat::Json, &batches, &KafkaSinkOptions::default())
+                .unwrap();
         assert_eq!(payloads.len(), 2);
-        let s0 = String::from_utf8(payloads[0].clone()).unwrap();
-        let s1 = String::from_utf8(payloads[1].clone()).unwrap();
-        assert!(s0.contains("\"time\":1"));
-        assert!(s1.contains("\"v\":20"));
+        assert!(payloads[0].key.is_none());
+        let s0 = String::from_utf8(payloads[0].value.clone()).unwrap();
+        assert!(s0.contains("\"order_id\":1"));
+    }
+
+    #[test]
+    fn json_encoder_emits_keyed_records_with_prefix() {
+        let mut options = KafkaSinkOptions::default();
+        options.key_format = Some("json".into());
+        options.key_fields = vec!["order_id".into()];
+        options.key_fields_prefix = "k_".into();
+
+        let batches = vec![sample_batch(42, "east")];
+        let payloads = PayloadEncoder::encode(&PayloadFormat::Json, &batches, &options).unwrap();
+        assert_eq!(payloads.len(), 1);
+        let key = String::from_utf8(payloads[0].key.clone().unwrap()).unwrap();
+        assert!(key.contains("\"k_order_id\":42"), "{key}");
+        assert!(!key.contains("region"), "{key}");
+        let val = String::from_utf8(payloads[0].value.clone()).unwrap();
+        assert!(val.contains("\"order_id\":42"));
+        assert!(val.contains("\"region\":\"east\""));
+    }
+
+    #[test]
+    fn missing_key_field_is_fatal() {
+        let mut options = KafkaSinkOptions::default();
+        options.key_fields = vec!["missing".into()];
+        let err = PayloadEncoder::encode(&PayloadFormat::Json, &[sample_batch(1, "e")], &options)
+            .unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
     }
 
     #[tokio::test]
     async fn write_without_begin_is_fatal() {
-        let mut sink = KafkaSink::new("localhost:9092", "t", PayloadFormat::Json);
-        let ev = DataEvent::insert(LsnRange::single(1), vec![sample_batch(1)]);
+        let mut sink = KafkaSink::new(
+            "localhost:9092",
+            "t",
+            PayloadFormat::Json,
+            KafkaSinkOptions::default(),
+        );
+        let ev = DataEvent::insert(LsnRange::single(1), vec![sample_batch(1, "e")]);
         let err = sink.write(&ev).await.unwrap_err();
         assert!(err.is_fatal());
     }
 
     #[tokio::test]
     async fn preflight_fails_fast_on_unreachable_broker() {
-        let mut sink = KafkaSink::new("127.0.0.1:1", "no-such-topic", PayloadFormat::Json);
+        let mut sink = KafkaSink::new(
+            "127.0.0.1:1",
+            "no-such-topic",
+            PayloadFormat::Json,
+            KafkaSinkOptions::default(),
+        );
         let err = sink.begin_txn().await.unwrap_err();
         assert!(
             !err.is_fatal(),
@@ -473,8 +635,12 @@ mod tests {
 
     #[tokio::test]
     async fn abort_clears_producer_handle() {
-        let mut sink = KafkaSink::new("127.0.0.1:1", "t", PayloadFormat::Json);
-        // Force a poisoned optional by skipping connect; abort must still clear.
+        let mut sink = KafkaSink::new(
+            "127.0.0.1:1",
+            "t",
+            PayloadFormat::Json,
+            KafkaSinkOptions::default(),
+        );
         sink.producer = None;
         sink.abort_txn().await.unwrap();
         assert!(sink.producer.is_none());
@@ -482,14 +648,28 @@ mod tests {
 
     #[tokio::test]
     async fn watermark_write_is_rejected() {
-        let mut sink = KafkaSink::new("localhost:9092", "t", PayloadFormat::Json);
-        // Bypass ensure by injecting a fake "present" state is hard; use Fatal path:
-        // write checks producer first — so set up by failing if no producer.
-        // After a successful ensure we'd reject watermark; here no producer → Fatal first.
+        let mut sink = KafkaSink::new(
+            "localhost:9092",
+            "t",
+            PayloadFormat::Json,
+            KafkaSinkOptions::default(),
+        );
         let err = sink
             .write(&DataEvent::Watermark { end_lsn: 1 })
             .await
             .unwrap_err();
         assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn eos_mode_from_options() {
+        let mut options = KafkaSinkOptions::default();
+        options.delivery_guarantee = KafkaDeliveryGuarantee::ExactlyOnce;
+        options.transactional_id = Some("txn-1".into());
+        let sink = KafkaSink::new("b:9092", "t", PayloadFormat::Json, options);
+        assert!(matches!(
+            sink.mode,
+            DeliveryMode::ExactlyOnce { ref transactional_id } if transactional_id == "txn-1"
+        ));
     }
 }

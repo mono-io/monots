@@ -292,3 +292,131 @@ async fn kafka_sink_flush_1k_write_10k_consumable() {
         TOTAL_ROWS / FLUSH_EVERY
     );
 }
+
+/// Keyed JSON + producer tuning: verify every key/value pair and full-set integrity
+/// (count, uniqueness, region split, key↔value consistency).
+#[tokio::test]
+async fn kafka_sink_keyed_tuning_complete() {
+    if let Err(e) = require_docker_stack().await {
+        eprintln!("SKIP kafka keyed IT: {e}");
+        return;
+    }
+
+    const ROWS: usize = 4_000;
+    const FLUSH: usize = 1_000;
+
+    let table = unique_table("kafka_key_src");
+    let stream = unique_table("kafka_key_stream");
+    let topic = unique_table("kafka_key_topic");
+    ensure_topic(&topic).await;
+
+    let mut inst = MonotsInstance::new("kafka_sink_keyed").unwrap();
+    inst.start().await.unwrap();
+    let mut client = inst.authenticated_client().await.unwrap();
+
+    client
+        .no_query(&format!(
+            "CREATE TABLE {table} (time BIGINT NOT NULL, region VARCHAR, value BIGINT)"
+        ))
+        .await
+        .unwrap();
+
+    client
+        .no_query(&format!(
+            "CREATE STREAM {stream} WITH (
+              'sink.type' = 'kafka',
+              'sink.kafka.brokers' = '{KAFKA_BOOTSTRAP}',
+              'sink.kafka.topic' = '{topic}',
+              'sink.format' = 'json',
+              'sink.kafka.key.format' = 'json',
+              'sink.kafka.key.fields' = 'value',
+              'sink.kafka.key.fields-prefix' = 'k_',
+              'sink.kafka.partitioner' = 'default',
+              'sink.kafka.delivery-guarantee' = 'at-least-once',
+              'sink.kafka.compression.type' = 'lz4',
+              'sink.kafka.batch.size' = '65536',
+              'sink.kafka.linger.ms' = '5',
+              'sink.kafka.acks' = 'all',
+              'sink.kafka.retries' = '5',
+              'source.table' = '{table}',
+              'cdc.mode' = 'batch'
+            )"
+        ))
+        .await
+        .unwrap();
+
+    let show = client
+        .query(&format!("SHOW STREAM {stream}"))
+        .await
+        .unwrap();
+    let ddl = scalar_str_named(&show, "create_statement");
+    assert!(ddl.contains("key.fields"), "{ddl}");
+    assert!(ddl.contains("compression.type"), "{ddl}");
+    assert!(ddl.contains("lz4"), "{ddl}");
+
+    let consumer = make_consumer(&topic);
+
+    let mut written = 0usize;
+    while written < ROWS {
+        let n = (ROWS - written).min(FLUSH);
+        let batch = metrics_batch(written as i64, n);
+        client.write_batches(&table, vec![batch]).await.unwrap();
+        client
+            .no_query(&format!("FLUSH TABLE {table}"))
+            .await
+            .unwrap();
+        written += n;
+    }
+    wait_stream_not_failed(&mut client, &stream).await;
+
+    #[derive(Deserialize, Debug)]
+    struct KeyPayload {
+        k_value: i64,
+    }
+
+    let start = Instant::now();
+    let mut rows = Vec::with_capacity(ROWS);
+    while rows.len() < ROWS {
+        if start.elapsed() > Duration::from_secs(120) {
+            break;
+        }
+        match timeout(Duration::from_secs(2), consumer.recv()).await {
+            Ok(Ok(msg)) => {
+                let payload = msg.payload().expect("value payload");
+                let key = msg.key().expect("key payload required for keyed sink");
+                let value: MetricsRow = serde_json::from_slice(payload).unwrap();
+                let key_obj: KeyPayload = serde_json::from_slice(key).unwrap_or_else(|e| {
+                    panic!("bad key json: {e}; key={}", String::from_utf8_lossy(key))
+                });
+                assert_eq!(
+                    key_obj.k_value, value.value,
+                    "key.k_value must equal value.value"
+                );
+                let expected = generate_expected_row(value.value);
+                assert_eq!(value, expected);
+                rows.push(value);
+            }
+            Ok(Err(e)) if is_retryable_kafka_error(&e) => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Ok(Err(e)) => panic!("kafka consumer error: {e}"),
+            Err(_) => {}
+        }
+    }
+
+    assert_eq!(rows.len(), ROWS, "must consume all keyed rows");
+    rows.sort_by_key(|r| r.value);
+    // Uniqueness + contiguous 0..N-1
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.value, i as i64);
+        assert_eq!(*row, generate_expected_row(i as i64));
+    }
+    let east = rows.iter().filter(|r| r.region == "east").count();
+    let west = rows.iter().filter(|r| r.region == "west").count();
+    assert_eq!(east, ROWS / 2);
+    assert_eq!(west, ROWS / 2);
+    let sum: i64 = rows.iter().map(|r| r.value).sum();
+    assert_eq!(sum, (ROWS as i64 - 1) * ROWS as i64 / 2);
+
+    eprintln!("kafka keyed IT passed: {ROWS} rows with key/value integrity");
+}

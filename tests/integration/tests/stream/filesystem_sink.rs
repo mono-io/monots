@@ -23,7 +23,15 @@ use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::Client as S3Client;
+use monots_integration_tests::framework::docker::{
+    require_docker_stack, MINIO_ACCESS_KEY, MINIO_BUCKET, MINIO_ENDPOINT, MINIO_SECRET_KEY,
+};
 use monots_integration_tests::{scalar_i64_named, scalar_str_named, unique_table, MonotsInstance};
+use tempfile::TempDir;
 
 const TOTAL_ROWS: usize = 10_000;
 const FLUSH_EVERY: usize = 1_000;
@@ -316,4 +324,300 @@ async fn filesystem_sink_export_then_receiver_load_matches() {
         sender_fmt, receiver_fmt,
         "Sample data pretty format mismatch"
     );
+
+    // Region split must be exact (even/odd value → east/west).
+    let region_stats = receiver_client
+        .query(&format!(
+            "SELECT region, COUNT(*) AS c, SUM(value) AS s FROM {receiver_table} GROUP BY region ORDER BY region"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        scalar_i64_named(&region_stats, "c"),
+        TOTAL_ROWS as i64 / 2,
+        "first region group count (east) should be half; batches={region_stats:?}"
+    );
+
+    let distinct = receiver_client
+        .query(&format!(
+            "SELECT COUNT(DISTINCT value) AS d FROM {receiver_table}"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        scalar_i64_named(&distinct, "d"),
+        TOTAL_ROWS as i64,
+        "values must be unique 0..N-1"
+    );
+}
+
+/// `file://` URI must behave like a local path with full closed-loop integrity.
+#[tokio::test]
+async fn filesystem_sink_file_uri_export_load_complete() {
+    let sender_table = unique_table("fs_file_src");
+    let receiver_table = unique_table("fs_file_dst");
+    let stream = unique_table("fs_file_stream");
+
+    let mut sender = MonotsInstance::new("fs_sink_file_uri").unwrap();
+    let mut receiver = MonotsInstance::new("fs_sink_file_uri_recv").unwrap();
+    tokio::try_join!(sender.start(), receiver.start()).unwrap();
+
+    let export_root = sender.data_dir().join("fs_file_export");
+    fs::create_dir_all(&export_root).unwrap();
+    let export_uri = format!("file://{}", export_root.display());
+
+    let mut sender_client = sender.authenticated_client().await.unwrap();
+    let mut receiver_client = receiver.authenticated_client().await.unwrap();
+
+    sender_client
+        .no_query(&format!(
+            "CREATE TABLE {sender_table} (time BIGINT NOT NULL, region VARCHAR, value BIGINT)"
+        ))
+        .await
+        .unwrap();
+    receiver_client
+        .no_query(&format!(
+            "CREATE TABLE {receiver_table} (time BIGINT NOT NULL, region VARCHAR, value BIGINT)"
+        ))
+        .await
+        .unwrap();
+
+    sender_client
+        .no_query(&format!(
+            "CREATE STREAM {stream} WITH (
+              'sink.type' = 'filesystem',
+              'sink.filesystem.path' = '{export_uri}',
+              'source.table' = '{sender_table}',
+              'cdc.mode' = 'batch'
+            )"
+        ))
+        .await
+        .unwrap();
+
+    let mut written = 0usize;
+    while written < TOTAL_ROWS {
+        let n = (TOTAL_ROWS - written).min(FLUSH_EVERY);
+        let batch = metrics_batch(BASE_TS + written as i64, written as i64, n);
+        sender_client
+            .write_batches(&sender_table, vec![batch])
+            .await
+            .unwrap();
+        sender_client
+            .no_query(&format!("FLUSH TABLE {sender_table}"))
+            .await
+            .unwrap();
+        written += n;
+    }
+
+    let table_export_dir = export_root.join(&sender_table);
+    wait_export_ready(
+        &mut sender_client,
+        &stream,
+        &table_export_dir,
+        EXPECTED_FILES,
+        Duration::from_secs(90),
+    )
+    .await;
+
+    let loaded = receiver_client
+        .no_query(&format!(
+            "LOAD PARQUET '{}' INTO {receiver_table}",
+            table_export_dir.display()
+        ))
+        .await
+        .unwrap();
+    assert_eq!(loaded, TOTAL_ROWS as u64);
+
+    let expected = ExpectedStats::new();
+    assert_table_stats(
+        &mut receiver_client,
+        &receiver_table,
+        "file_uri_recv",
+        &expected,
+    )
+    .await;
+
+    let distinct = receiver_client
+        .query(&format!(
+            "SELECT COUNT(DISTINCT value) AS d FROM {receiver_table}"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(scalar_i64_named(&distinct, "d"), TOTAL_ROWS as i64);
+}
+
+/// Filesystem sink to MinIO (`s3://`) — download objects, LOAD, verify full integrity.
+#[tokio::test]
+async fn filesystem_sink_minio_export_load_complete() {
+    if let Err(e) = require_docker_stack().await {
+        eprintln!("SKIP filesystem MinIO IT: {e}");
+        return;
+    }
+
+    const ROWS: usize = 2_000;
+    const FLUSH: usize = 1_000;
+
+    let sender_table = unique_table("fs_s3_src");
+    let receiver_table = unique_table("fs_s3_dst");
+    let stream = unique_table("fs_s3_stream");
+    let prefix = unique_table("fs_s3");
+    let s3_uri = format!("s3://{MINIO_BUCKET}/{prefix}");
+
+    let region_provider = RegionProviderChain::default_provider().or_else("us-east-1");
+    let creds = Credentials::new(
+        MINIO_ACCESS_KEY,
+        MINIO_SECRET_KEY,
+        None,
+        None,
+        "minio-hardcoded",
+    );
+    let shared = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .credentials_provider(creds)
+        .endpoint_url(MINIO_ENDPOINT)
+        .load()
+        .await;
+    let s3_config = aws_sdk_s3::config::Builder::from(&shared)
+        .force_path_style(true)
+        .build();
+    let s3_client = S3Client::from_conf(s3_config);
+
+    let mut sender = MonotsInstance::new("fs_sink_minio").unwrap();
+    let mut receiver = MonotsInstance::new("fs_sink_minio_recv").unwrap();
+    tokio::try_join!(sender.start(), receiver.start()).unwrap();
+
+    let mut sender_client = sender.authenticated_client().await.unwrap();
+    let mut receiver_client = receiver.authenticated_client().await.unwrap();
+
+    sender_client
+        .no_query(&format!(
+            "CREATE TABLE {sender_table} (time BIGINT NOT NULL, region VARCHAR, value BIGINT)"
+        ))
+        .await
+        .unwrap();
+    receiver_client
+        .no_query(&format!(
+            "CREATE TABLE {receiver_table} (time BIGINT NOT NULL, region VARCHAR, value BIGINT)"
+        ))
+        .await
+        .unwrap();
+
+    sender_client
+        .no_query(&format!(
+            "CREATE STREAM {stream} WITH (
+              'sink.type' = 'filesystem',
+              'sink.filesystem.path' = '{s3_uri}',
+              'sink.filesystem.endpoint' = '{MINIO_ENDPOINT}',
+              'sink.filesystem.access.key' = '{MINIO_ACCESS_KEY}',
+              'sink.filesystem.secret.key' = '{MINIO_SECRET_KEY}',
+              'sink.filesystem.region' = 'us-east-1',
+              'sink.filesystem.path.style.access' = 'true',
+              'source.table' = '{sender_table}',
+              'cdc.mode' = 'batch'
+            )"
+        ))
+        .await
+        .unwrap();
+
+    let mut written = 0usize;
+    while written < ROWS {
+        let n = (ROWS - written).min(FLUSH);
+        let batch = metrics_batch(BASE_TS + written as i64, written as i64, n);
+        sender_client
+            .write_batches(&sender_table, vec![batch])
+            .await
+            .unwrap();
+        sender_client
+            .no_query(&format!("FLUSH TABLE {sender_table}"))
+            .await
+            .unwrap();
+        written += n;
+    }
+
+    // Wait until S3 has expected parquet objects under table prefix.
+    let object_prefix = format!("{prefix}/{sender_table}/");
+    let expect_files = ROWS / FLUSH;
+    let start = Instant::now();
+    let timeout = Duration::from_secs(180);
+    loop {
+        let status = sender_client
+            .query(&format!("SHOW STREAM STATUS FOR {stream}"))
+            .await
+            .unwrap();
+        let phase = scalar_str_named(&status, "phase");
+        if matches!(phase.as_str(), "failed" | "suspended") {
+            panic!("filesystem minio stream terminal phase={phase}");
+        }
+        let list = s3_client
+            .list_objects_v2()
+            .bucket(MINIO_BUCKET)
+            .prefix(&object_prefix)
+            .send()
+            .await
+            .unwrap();
+        let parquet_n = list
+            .contents()
+            .iter()
+            .filter(|o| o.key().unwrap_or_default().ends_with(".parquet"))
+            .count();
+        if parquet_n >= expect_files {
+            break;
+        }
+        if start.elapsed() > timeout {
+            panic!("filesystem MinIO incomplete: parquet={parquet_n}/{expect_files} phase={phase}");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let download = temp.path();
+    let list = s3_client
+        .list_objects_v2()
+        .bucket(MINIO_BUCKET)
+        .prefix(&object_prefix)
+        .send()
+        .await
+        .unwrap();
+    for object in list.contents() {
+        let Some(key) = object.key() else { continue };
+        if !key.ends_with(".parquet") {
+            continue;
+        }
+        let name = key.rsplit('/').next().unwrap_or(key);
+        let get = s3_client
+            .get_object()
+            .bucket(MINIO_BUCKET)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let bytes = get.body.collect().await.unwrap().into_bytes();
+        tokio::fs::write(download.join(name), &bytes).await.unwrap();
+    }
+
+    let loaded = receiver_client
+        .no_query(&format!(
+            "LOAD PARQUET '{}' INTO {receiver_table}",
+            download.display()
+        ))
+        .await
+        .unwrap();
+    assert_eq!(loaded, ROWS as u64, "loaded row count");
+
+    let stats = receiver_client
+        .query(&format!(
+            "SELECT COUNT(*) AS c, SUM(value) AS s, MIN(value) AS vmin, MAX(value) AS vmax, \
+             COUNT(DISTINCT value) AS d FROM {receiver_table}"
+        ))
+        .await
+        .unwrap();
+    let expected_c = ROWS as i64;
+    let expected_sum = (ROWS as i64 - 1) * ROWS as i64 / 2;
+    assert_eq!(scalar_i64_named(&stats, "c"), expected_c);
+    assert_eq!(scalar_i64_named(&stats, "s"), expected_sum);
+    assert_eq!(scalar_i64_named(&stats, "vmin"), 0);
+    assert_eq!(scalar_i64_named(&stats, "vmax"), expected_c - 1);
+    assert_eq!(scalar_i64_named(&stats, "d"), expected_c);
+
+    eprintln!("filesystem MinIO IT passed: {ROWS} rows verified end-to-end");
 }

@@ -17,6 +17,7 @@
 pub mod def;
 pub mod delta_options;
 pub mod event;
+pub mod kafka_options;
 pub mod metrics;
 pub mod source_spec;
 pub mod state;
@@ -28,6 +29,9 @@ pub use def::{
 };
 pub use delta_options::DeltaSinkOptions;
 pub use event::{DataEvent, IngressEvent, InsertArrow};
+pub use kafka_options::{
+    KafkaDeliveryGuarantee, KafkaPartitioner, KafkaSinkOptions, KAFKA_OPTION_KEYS,
+};
 pub use metrics::{
     ExecutionStep, MetricsRegistry, RuntimeStateRegistry, StreamMetrics, StreamRuntimeState,
 };

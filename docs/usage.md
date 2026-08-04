@@ -79,9 +79,9 @@ DROP STREAM metrics_out;
 
 | Sink Type  | Key Properties                           |
 |------------|------------------------------------------|
-| filesystem | `sink.filesystem.path`                   |
+| filesystem | `sink.filesystem.path`, optional `sink.filesystem.endpoint` + S3 client defaults (same knobs as delta under `sink.filesystem.*`) |
 | delta      | `sink.delta.path`, `sink.delta.endpoint`, plus S3 client defaults (`region`, path-style, retries — see streams.md) |
-| kafka      | `sink.kafka.brokers`, `sink.kafka.topic` |
+| kafka      | `sink.kafka.brokers`, `sink.kafka.topic`, plus key/partitioner/delivery/tuning/SASL/SSL options (see streams.md) |
 
 **Note:** For S3/MinIO integrations, credentials prefer `sink.delta.access.key` / `sink.delta.secret.key` when set; otherwise use `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_REGION`. Omitting Delta optional keys still fills and persists the defaults.
 

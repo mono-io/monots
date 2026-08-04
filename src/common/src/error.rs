@@ -14,6 +14,8 @@
 
 use thiserror::Error;
 
+use std::path::PathBuf;
+
 #[derive(Error, Debug)]
 pub enum TsdbError {
     #[error("IO error: {0}")]
@@ -24,6 +26,13 @@ pub enum TsdbError {
 
     #[error("storage error: {0}")]
     Storage(String),
+
+    #[error("storage IO error at {path}")]
+    StorageIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("query error: {0}")]
     Query(String),
@@ -75,6 +84,13 @@ impl From<datafusion_common::DataFusionError> for TsdbError {
 pub type Result<T> = std::result::Result<T, TsdbError>;
 
 impl TsdbError {
+    pub fn storage_io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        Self::StorageIo {
+            path: path.into(),
+            source,
+        }
+    }
+
     pub fn memory_limit_exceeded(used_bytes: usize, limit_bytes: usize) -> Self {
         Self::MemoryLimitExceeded {
             used_bytes,
@@ -96,5 +112,13 @@ impl TsdbError {
 
     pub fn is_disk_read_only(&self) -> bool {
         matches!(self, Self::DiskReadOnly { .. })
+    }
+
+    /// Underlying `io::ErrorKind` when this is an IO-backed failure.
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Self::Io(e) | Self::StorageIo { source: e, .. } => Some(e.kind()),
+            _ => None,
+        }
     }
 }

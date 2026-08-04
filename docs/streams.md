@@ -47,8 +47,6 @@ Every stream requires a `WITH` clause to define its sink and capture behavior.
 | `cdc.mode`     | No       | `batch` (historical Parquet files only) or `hybrid` (historical files + live WAL tailing). Defaults depend on the sink.                   |
 | `cdc.auto_end` | No       | `true` or `false` (default). If `true`, the stream automatically terminates after the current historical export finishes (one-shot mode). |
 
-*(Note: Legacy flat keys like `sink.path` are still accepted for backward compatibility, but prefixed keys like `sink.delta.path` are highly recommended.)*
-
 ---
 
 ## Sink: Delta Lake (`sink.type = 'delta'`)
@@ -58,12 +56,20 @@ Exports data as standard Delta Lake tables. Supports Optimistic Concurrency Cont
 - **Default `cdc.mode`:** `batch`
 - **Default `sink.format`:** `parquet`
 
-| Property              | Description                                                                                                              |
-|-----------------------|--------------------------------------------------------------------------------------------------------------------------|
-| `sink.delta.path`     | The Delta table root URI. Supports local paths, `file://`, `s3://`, and `s3a://`. (GCS and Azure are not yet supported). |
-| `sink.delta.endpoint` | (Optional) Custom S3-compatible API endpoint (e.g., a MinIO URL).                                                        |
+| Property | Default | Description |
+|----------|---------|-------------|
+| `sink.delta.path` | *(required)* | Delta table root URI. Supports local paths, `file://`, `s3://`, and `s3a://`. (GCS and Azure are not yet supported). |
+| `sink.delta.endpoint` | *(optional)* | Custom S3-compatible API endpoint (e.g., a MinIO URL). |
+| `sink.delta.access.key` / `sink.delta.secret.key` | *(env)* | Optional explicit credentials; otherwise use `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. |
+| `sink.delta.region` | `us-east-1` | S3 region (`AWS_REGION`). |
+| `sink.delta.path.style.access` | auto | Path-style addressing; defaults to `true` when `sink.delta.endpoint` is set (MinIO / OSS), else `false`. |
+| `sink.delta.connection.maximum` | `500` | Object-store concurrency limit. |
+| `sink.delta.connection.timeout` | `200s` | Connect / request timeout. SQL accepts durations (`200s`, `3 min`, `200000ms`) or bare ms integers. |
+| `sink.delta.attempts.maximum` | `20` | Object-store request retry budget. |
 
-**Cloud Object Storage (S3):** When writing to S3, MonoTS automatically picks up credentials from standard environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`).
+Omitting any of the optional keys above still **fills and persists the defaults**. `SHOW CREATE` / reconstructed DDL always materializes the full set. These options are passed into the object-store client at runtime.
+
+**Cloud Object Storage (S3):** Credentials prefer DDL keys when set; otherwise MonoTS picks up `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_REGION` from the environment.
 
 ```sql
 CREATE STREAM metrics_delta WITH (

@@ -174,6 +174,7 @@ impl TryFrom<proto::stream::StreamDef> for StreamDef {
             ConnectorType::Delta => SinkConfig::Delta {
                 path: pb.sink_path.unwrap_or_default(),
                 endpoint: pb.sink_endpoint.filter(|s| !s.is_empty()),
+                options: crate::model::DeltaSinkOptions::from_properties(&pb.properties)?,
             },
             ConnectorType::Filesystem => SinkConfig::Filesystem {
                 path: pb.sink_path.unwrap_or_default(),
@@ -206,7 +207,10 @@ impl From<&StreamDef> for proto::stream::StreamDef {
             from_timestamp: 0,
             to_timestamp: None,
             auto_end: def.auto_end,
-            properties: Default::default(),
+            properties: def
+                .delta_options()
+                .map(|o| o.to_properties())
+                .unwrap_or_default(),
             created_at_ms: def.created_at_ms,
             sink_endpoint: def.sink_endpoint().map(|s| s.to_string()),
         }
@@ -349,6 +353,7 @@ mod tests {
             sink_config: SinkConfig::Delta {
                 path: "/tmp/x".into(),
                 endpoint: None,
+                options: crate::model::DeltaSinkOptions::default(),
             },
             created_at_ms: 1,
             auto_end: false,
@@ -361,12 +366,16 @@ mod tests {
             sink_config: SinkConfig::Delta {
                 path: "s3://b/t".into(),
                 endpoint: Some("http://127.0.0.1:9000".into()),
+                options: crate::model::DeltaSinkOptions::default(),
             },
             ..sample()
         })
         .unwrap();
         let v = decode_versioned_stream_def(&bytes).unwrap();
         assert_eq!(v.inner.sink_endpoint(), Some("http://127.0.0.1:9000"));
+        let opts = v.inner.delta_options().unwrap();
+        assert_eq!(opts.region, "us-east-1");
+        assert_eq!(opts.connection_maximum, 500);
     }
 
     #[test]

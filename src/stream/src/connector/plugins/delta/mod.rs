@@ -20,14 +20,18 @@
 //! Industrial-grade guarantees:
 //! - **ACID 2PC**: Stage/rename (or upload) Parquet first, then commit `_delta_log`.
 //! - **State retention**: Caches `DeltaTable` to avoid re-parsing the transaction log.
-//! - **Phantom file safety**: Failed log commits leave unreferenced data files for `VACUUM`.
-//! - **OCC with Inner Retry**: Automatically refreshes snapshot and retries on concurrent
-//!   writer conflicts (max 5 attempts with backoff).
+//! - **Concurrent streaming upload**: bounded parallelism + chunked `BufWriter` (no full-file RAM).
+//! - **OCC with jittered exponential backoff**: resists thundering herds under multi-writer load.
+//! - **Orphan cleanup**: best-effort delete of uploaded Parquet if `_delta_log` commit fails.
+//! - **Credential refresh**: on auth/403, drop cached table and rebuild options (DefaultCreds / IAM).
 //!
-//! Credentials: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION`.
-//! MinIO / custom S3 API URL belongs on the stream as DDL `sink.delta.endpoint`
-//! (process-wide `MONOTS_LAKE_ENDPOINT` is only a fallback when `sink.delta.endpoint` is omitted). Single-writer S3
-//! commits use `AWS_S3_ALLOW_UNSAFE_RENAME=true` (same model as FunctionStream).
+//! Credentials: prefer DDL `sink.delta.access.key` / `sink.delta.secret.key`; otherwise leave
+//! keys unset so `deltalake::aws` / object_store use the default AWS credential chain
+//! (env, shared config, IAM role, STS). Custom endpoint: DDL `sink.delta.endpoint`.
+
+mod error;
+
+pub use error::DeltaSinkError;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -43,18 +47,29 @@ use deltalake::protocol::{DeltaOperation, SaveMode};
 use deltalake::{
     open_table, open_table_with_storage_options, DeltaOps, DeltaTable, DeltaTableError,
 };
+use futures::stream::{self, StreamExt};
+use object_store::buffered::BufWriter;
 use object_store::path::Path as ObjectPath;
-use object_store::PutPayload;
+use object_store::ObjectStore;
+use rand::Rng;
 use tokio::fs;
-use tracing::{debug, info, warn};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::connector::{SinkConnector, SinkError};
 use crate::model::event::DataEvent;
+use crate::model::DeltaSinkOptions;
 
 use super::parquet_dir::ParquetDirStaging;
 
 /// Max OCC retries with snapshot refresh when concurrent writers collide on `_delta_log`.
 const OCC_MAX_RETRIES: usize = 5;
+/// Cap concurrent object uploads to avoid S3 SlowDown / network saturation.
+const MAX_UPLOAD_CONCURRENCY: usize = 16;
+/// Chunk size when streaming a staged Parquet into `BufWriter`.
+const UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const OCC_BASE_DELAY_MS: u64 = 50;
+const OCC_MAX_DELAY_MS: u64 = 2_000;
 
 static AWS_HANDLERS: Once = Once::new();
 
@@ -109,24 +124,17 @@ fn staging_root_for(uri: &str) -> PathBuf {
     }
 }
 
-fn storage_options(endpoint: Option<&str>) -> HashMap<String, String> {
-    let mut opts = HashMap::new();
-    // Single writer per table/stream (FunctionStream default).
-    opts.insert("AWS_S3_ALLOW_UNSAFE_RENAME".into(), "true".into());
-    if let Some(ep) = endpoint.filter(|s| !s.is_empty()) {
-        opts.insert("AWS_ENDPOINT_URL".into(), ep.to_string());
-        opts.insert("AWS_ENDPOINT".into(), ep.to_string());
-        opts.insert("AWS_ALLOW_HTTP".into(), "true".into());
-    }
-    opts
-}
-
 pub struct DeltaSink {
     table_uri: String,
     remote: bool,
     staging: ParquetDirStaging,
     delta_table: Option<DeltaTable>,
+    options: DeltaSinkOptions,
+    endpoint: Option<String>,
+    /// When true, DDL supplied static access/secret keys (cannot rotate via IAM/STS).
+    static_credentials: bool,
     storage_options: HashMap<String, String>,
+    upload_concurrency: usize,
     in_transaction: bool,
 }
 
@@ -136,19 +144,54 @@ impl DeltaSink {
         path_or_uri: impl Into<String>,
         _table: Option<String>,
         endpoint: Option<String>,
+        options: DeltaSinkOptions,
     ) -> Self {
         let table_uri = normalize_table_uri(&path_or_uri.into());
         let remote = is_object_uri(&table_uri);
         let staging_path = staging_root_for(&table_uri);
-        let storage_options = storage_options(endpoint.as_deref());
+        let static_credentials = options.access_key.is_some() || options.secret_key.is_some();
+        let storage_options = options.storage_options(endpoint.as_deref());
+        let upload_concurrency =
+            (options.connection_maximum as usize).clamp(1, MAX_UPLOAD_CONCURRENCY);
 
         Self {
             staging: ParquetDirStaging::new(staging_path, None),
             table_uri,
             remote,
             delta_table: None,
+            options,
+            endpoint,
+            static_credentials,
             storage_options,
+            upload_concurrency,
             in_transaction: false,
+        }
+    }
+
+    /// Drop cached table handle and rebuild `storage_options` so object_store can pick up
+    /// rotated IAM/STS credentials from the default provider chain.
+    #[instrument(skip(self), fields(uri = %self.table_uri, static_creds = self.static_credentials))]
+    pub fn refresh_credentials(&mut self) {
+        if self.static_credentials {
+            warn!("static DDL credentials cannot be rotated; clearing table handle only");
+        } else {
+            info!("rebuilding storage_options for default AWS credential chain");
+            self.storage_options = self.options.storage_options(self.endpoint.as_deref());
+        }
+        self.delta_table = None;
+    }
+
+    fn maybe_refresh_on_error(&mut self, err: &SinkError) {
+        let msg = err.to_string().to_ascii_lowercase();
+        if msg.contains("403")
+            || msg.contains("401")
+            || msg.contains("forbidden")
+            || msg.contains("accessdenied")
+            || msg.contains("expired")
+            || msg.contains("invalidtoken")
+            || msg.contains("auth error")
+        {
+            self.refresh_credentials();
         }
     }
 
@@ -305,43 +348,69 @@ impl DeltaSink {
         }
     }
 
-    /// Object URI: PUT locally staged Parquet into the table store before Add commit.
+    /// Object URI: stream staged Parquet into the table store (bounded concurrency) before Add commit.
+    #[instrument(skip(self, table, committed_files), fields(uri = %self.table_uri, files = committed_files.len()))]
     async fn publish_data_files(
         &self,
         table: &DeltaTable,
         committed_files: &[(PathBuf, u64)],
-    ) -> Result<(), SinkError> {
+    ) -> Result<Vec<String>, SinkError> {
         if !self.remote {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let store = table.object_store();
+        let uri = self.table_uri.clone();
+        let concurrency = self.upload_concurrency;
+
+        // Precompute keys (path → object key) on this task before fan-out.
+        let mut jobs = Vec::with_capacity(committed_files.len());
         for (file_path, _) in committed_files {
             let relative = self.relative_add_path(file_path)?;
-            let bytes = fs::read(file_path).await.map_err(|e| {
-                SinkError::Transient(format!(
-                    "Failed to read staged file {} for upload: {e}",
-                    file_path.display()
-                ))
-            })?;
-            let key = ObjectPath::from(relative.as_str());
-            store
-                .put(&key, PutPayload::from(bytes))
-                .await
-                .map_err(|e| {
-                    SinkError::Transient(format!(
-                        "Failed to upload {} to {}: {e}",
-                        file_path.display(),
-                        self.table_uri
-                    ))
-                })?;
-            debug!(
-                key = %key,
-                uri = %self.table_uri,
-                "uploaded staged Parquet to object storage"
-            );
+            jobs.push((file_path.clone(), relative));
         }
-        Ok(())
+
+        let results: Vec<Result<String, SinkError>> = stream::iter(jobs)
+            .map(|(file_path, relative)| {
+                let store = store.clone();
+                let uri = uri.clone();
+                async move {
+                    let key = ObjectPath::from(relative.as_str());
+                    upload_file_chunked(store, key.clone(), &file_path, &uri).await?;
+                    debug!(key = %key, path = %file_path.display(), "streamed Parquet upload complete");
+                    Ok(relative)
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        let mut uploaded = Vec::with_capacity(results.len());
+        for r in results {
+            uploaded.push(r?);
+        }
+        Ok(uploaded)
+    }
+
+    /// Best-effort delete of objects already PUT but never referenced by `_delta_log`.
+    #[instrument(skip(self, table, keys), fields(uri = %self.table_uri, orphans = keys.len()))]
+    async fn cleanup_orphaned_uploads(&self, table: &DeltaTable, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        error!(
+            keys = ?keys,
+            "Delta log commit failed after uploads; attempting orphan Parquet cleanup"
+        );
+        let store = table.object_store();
+        for key in keys {
+            let path = ObjectPath::from(key.as_str());
+            if let Err(e) = store.delete(&path).await {
+                warn!(key = %key, error = %e, "failed to delete orphaned Parquet object");
+            } else {
+                info!(key = %key, "deleted orphaned Parquet object");
+            }
+        }
     }
 
     async fn build_add_actions(
@@ -351,12 +420,12 @@ impl DeltaSink {
         let mut actions = Vec::with_capacity(committed_files.len());
 
         for (file_path, rows) in committed_files {
-            let meta = fs::metadata(file_path).await.map_err(|e| {
-                SinkError::Fatal(format!(
-                    "Failed to stat committed file {}: {e}",
-                    file_path.display()
-                ))
-            })?;
+            let meta = fs::metadata(file_path)
+                .await
+                .map_err(|e| DeltaSinkError::Io {
+                    path: file_path.clone(),
+                    source: e,
+                })?;
 
             let modification_time = meta
                 .modified()
@@ -380,7 +449,8 @@ impl DeltaSink {
         Ok(actions)
     }
 
-    /// Phase 2: append Add actions to `_delta_log` via OCC CommitBuilder with inner retry loop.
+    /// Phase 2: append Add actions to `_delta_log` via OCC CommitBuilder with jittered backoff.
+    #[instrument(skip(self, committed_files), fields(uri = %self.table_uri, files = committed_files.len()))]
     async fn commit_to_delta_log(
         &mut self,
         committed_files: Vec<(PathBuf, u64)>,
@@ -392,35 +462,42 @@ impl DeltaSink {
         let schema_hint = schema_from_parquet(&committed_files[0].0)?;
         self.ensure_delta_link(Some(schema_hint)).await?;
 
-        {
+        let uploaded_keys = {
             let table = self.delta_table.as_ref().ok_or_else(|| {
-                SinkError::Fatal("Delta table handle missing after ensure_delta_link".into())
+                DeltaSinkError::Fatal("Delta table handle missing after ensure_delta_link".into())
             })?;
-            self.publish_data_files(table, &committed_files).await?;
-        }
+            match self.publish_data_files(table, &committed_files).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    self.maybe_refresh_on_error(&e);
+                    return Err(e);
+                }
+            }
+        };
 
         let actions = self.build_add_actions(&committed_files).await?;
 
-        // Inner OCC retry loop: refresh snapshot and retry on concurrent writer conflicts
-        // so staged/uploaded Parquet files are not left permanently uncommitted after a
-        // single VersionAlreadyExists / CommitConflict.
-        let mut attempt = 0;
+        let mut attempt = 0usize;
         loop {
             let table = self
                 .delta_table
                 .as_mut()
-                .ok_or_else(|| SinkError::Fatal("Delta table handle missing".into()))?;
+                .ok_or_else(|| DeltaSinkError::Fatal("Delta table handle missing".into()))?;
 
             if attempt > 0 {
                 if let Err(e) = table.update().await {
-                    warn!(error = %e, "Failed to refresh table state during OCC retry");
+                    warn!(error = %e, attempt, "Failed to refresh table state during OCC retry");
                 }
             }
 
             let snapshot = match table.snapshot() {
                 Ok(s) => s.clone(),
                 Err(e) => {
-                    return Err(SinkError::Fatal(format!("Delta snapshot unavailable: {e}")));
+                    return Err(DeltaSinkError::Table {
+                        uri: self.table_uri.clone(),
+                        source: e,
+                    }
+                    .into());
                 }
             };
             let log_store = table.log_store().clone();
@@ -431,9 +508,6 @@ impl DeltaSink {
                 predicate: None,
             };
 
-            // Disable CommitBuilder's own retry budget so each attempt uses a freshly
-            // refreshed snapshot from our outer loop (builder default is 15 retries on a
-            // fixed snapshot base).
             let commit_result = CommitBuilder::default()
                 .with_max_retries(1)
                 .with_actions(actions.clone())
@@ -465,32 +539,103 @@ impl DeltaSink {
                 }
                 Err(e) => {
                     let err_str = e.to_string();
-                    if (err_str.contains("VersionAlreadyExists")
-                        || err_str.contains("Concurrent")
-                        || err_str.contains("CommitConflict")
-                        || err_str.contains("MaxCommitAttempts"))
-                        && attempt < OCC_MAX_RETRIES
-                    {
+                    if is_occ_conflict(&err_str) && attempt < OCC_MAX_RETRIES {
                         attempt += 1;
+                        let delay = occ_backoff_with_jitter(attempt);
                         warn!(
                             attempt,
                             max_retries = OCC_MAX_RETRIES,
-                            "Delta OCC conflict detected; retrying commit with refreshed snapshot..."
+                            delay_ms = delay.as_millis() as u64,
+                            "Delta OCC conflict; retrying with jittered exponential backoff"
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(50 * attempt as u64))
-                            .await;
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
 
-                    // Fatal or retries exhausted: clear handle to force reload on next attempt
+                    // Exhausted / fatal: best-effort orphan cleanup then force reload.
+                    if self.remote && !uploaded_keys.is_empty() {
+                        if let Some(t) = self.delta_table.as_ref() {
+                            self.cleanup_orphaned_uploads(t, &uploaded_keys).await;
+                        }
+                    }
                     self.delta_table = None;
-                    return Err(SinkError::Transient(format!(
-                        "Delta log commit failed after retries: {err_str}"
-                    )));
+                    if is_occ_conflict(&err_str) {
+                        return Err(DeltaSinkError::ConcurrentConflict {
+                            uri: self.table_uri.clone(),
+                            attempts: attempt,
+                            source: e,
+                        }
+                        .into());
+                    }
+                    return Err(DeltaSinkError::Table {
+                        uri: self.table_uri.clone(),
+                        source: e,
+                    }
+                    .into());
                 }
             }
         }
     }
+}
+
+async fn upload_file_chunked(
+    store: std::sync::Arc<dyn ObjectStore>,
+    key: ObjectPath,
+    file_path: &Path,
+    uri: &str,
+) -> Result<(), SinkError> {
+    let mut file = fs::File::open(file_path)
+        .await
+        .map_err(|e| DeltaSinkError::Io {
+            path: file_path.to_path_buf(),
+            source: e,
+        })?;
+    let mut writer = BufWriter::with_capacity(store, key, UPLOAD_CHUNK_BYTES);
+    let mut buf = vec![0u8; UPLOAD_CHUNK_BYTES];
+    loop {
+        let n = file.read(&mut buf).await.map_err(|e| DeltaSinkError::Io {
+            path: file_path.to_path_buf(),
+            source: e,
+        })?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n]).await.map_err(|e| {
+            DeltaSinkError::Transient(format!(
+                "stream upload write failed for {} → {uri}: {e}",
+                file_path.display()
+            ))
+        })?;
+    }
+    writer.shutdown().await.map_err(|e| {
+        // BufWriter maps object_store errors into io::Error; classify via message.
+        let msg = e.to_string();
+        if msg.to_ascii_lowercase().contains("403")
+            || msg.to_ascii_lowercase().contains("forbidden")
+            || msg.to_ascii_lowercase().contains("expired")
+        {
+            DeltaSinkError::Transient(format!("auth during upload to {uri}: {msg}"))
+        } else {
+            DeltaSinkError::Transient(format!("stream upload finalize failed for {uri}: {msg}"))
+        }
+    })?;
+    Ok(())
+}
+
+fn is_occ_conflict(err_str: &str) -> bool {
+    err_str.contains("VersionAlreadyExists")
+        || err_str.contains("Concurrent")
+        || err_str.contains("CommitConflict")
+        || err_str.contains("MaxCommitAttempts")
+}
+
+fn occ_backoff_with_jitter(attempt: usize) -> std::time::Duration {
+    let exp = attempt.saturating_sub(1).min(16) as u32;
+    let delay = OCC_BASE_DELAY_MS
+        .saturating_mul(2u64.saturating_pow(exp))
+        .min(OCC_MAX_DELAY_MS);
+    let jitter = rand::thread_rng().gen_range(0..=(delay / 2).max(1));
+    std::time::Duration::from_millis(delay + jitter)
 }
 
 fn schema_from_parquet(path: &Path) -> Result<Vec<StructField>, SinkError> {
@@ -587,6 +732,14 @@ mod schema_map_tests {
         assert_eq!(normalize_table_uri("file:///tmp/lake"), "/tmp/lake");
         assert_eq!(normalize_table_uri("/tmp/lake"), "/tmp/lake");
     }
+    #[test]
+    fn occ_backoff_grows_with_jitter_cap() {
+        for attempt in 1..=6 {
+            let d = occ_backoff_with_jitter(attempt);
+            assert!(d.as_millis() >= OCC_BASE_DELAY_MS as u128);
+            assert!(d.as_millis() <= (OCC_MAX_DELAY_MS + OCC_MAX_DELAY_MS / 2) as u128);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -646,8 +799,19 @@ impl SinkConnector for DeltaSink {
         Ok(())
     }
 
+    async fn reset(&mut self) -> Result<(), SinkError> {
+        self.refresh_credentials();
+        self.abort_txn().await
+    }
+
     async fn ping(&mut self) -> Result<(), SinkError> {
-        self.ensure_delta_link(None).await
+        match self.ensure_delta_link(None).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.maybe_refresh_on_error(&e);
+                Err(e)
+            }
+        }
     }
 
     async fn close(&mut self) -> Result<(), SinkError> {
@@ -699,7 +863,12 @@ mod tests {
         fs::create_dir_all(&src_dir).await.unwrap();
         let src = write_parquet(&src_dir, "part-0.parquet").await;
 
-        let mut sink = DeltaSink::new(table_path.to_string_lossy(), None, None);
+        let mut sink = DeltaSink::new(
+            table_path.to_string_lossy(),
+            None,
+            None,
+            DeltaSinkOptions::default(),
+        );
         sink.begin_txn().await.unwrap();
         sink.write(&DataEvent::FlushFile {
             file_path: Arc::from(src.to_string_lossy().as_ref()),
@@ -736,7 +905,12 @@ mod tests {
         fs::create_dir_all(&table_path).await.unwrap();
         let src = write_parquet(dir.path(), "part-0.parquet").await;
 
-        let mut sink = DeltaSink::new(table_path.to_string_lossy(), None, None);
+        let mut sink = DeltaSink::new(
+            table_path.to_string_lossy(),
+            None,
+            None,
+            DeltaSinkOptions::default(),
+        );
         sink.begin_txn().await.unwrap();
         sink.write(&DataEvent::FlushFile {
             file_path: Arc::from(src.to_string_lossy().as_ref()),
@@ -760,7 +934,7 @@ mod tests {
         let src = write_parquet(dir.path(), "part-0.parquet").await;
 
         let uri = format!("file://{}", table_path.display());
-        let mut sink = DeltaSink::new(uri, None, None);
+        let mut sink = DeltaSink::new(uri, None, None, DeltaSinkOptions::default());
         assert!(!sink.remote);
         sink.begin_txn().await.unwrap();
         sink.write(&DataEvent::FlushFile {
@@ -776,7 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_gs_uri_is_fatal_on_ping() {
-        let mut sink = DeltaSink::new("gs://bucket/table", None, None);
+        let mut sink = DeltaSink::new("gs://bucket/table", None, None, DeltaSinkOptions::default());
         let err = sink.ping().await.unwrap_err();
         assert!(err.is_fatal());
         assert!(err.to_string().contains("unsupported"));

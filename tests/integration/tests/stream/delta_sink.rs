@@ -245,7 +245,295 @@ async fn delta_local_flush_1k_write_queryable() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// Local CREATE with only path still materializes industrial S3 client defaults in SHOW CREATE.
+#[tokio::test]
+async fn delta_local_show_create_emits_s3_client_defaults() -> Result<(), Box<dyn std::error::Error>>
+{
+    let table = unique_table("delta_cfg_src");
+    let stream = unique_table("delta_cfg_stream");
+
+    let mut inst = MonotsInstance::new("delta_sink_show_defaults")?;
+    inst.start().await?;
+    let mut client = inst.authenticated_client().await?;
+
+    let lake = inst.data_dir().join("delta_lake").join(&table);
+    fs::create_dir_all(&lake)?;
+    let lake_path = lake.display().to_string();
+
+    client
+        .no_query(&format!(
+            "CREATE TABLE {table} (time BIGINT NOT NULL, region VARCHAR, value BIGINT)"
+        ))
+        .await?;
+    client
+        .no_query(&format!(
+            "CREATE STREAM {stream} WITH (
+              'sink.type' = 'delta',
+              'sink.delta.path' = '{lake_path}',
+              'source.table' = '{table}'
+            )"
+        ))
+        .await?;
+
+    let detail = client.query(&format!("SHOW STREAM {stream}")).await?;
+    let ddl = scalar_str_named(&detail, "create_statement");
+    assert!(
+        ddl.contains("'sink.delta.region' = 'us-east-1'"),
+        "missing region default: {ddl}"
+    );
+    assert!(
+        ddl.contains("'sink.delta.path.style.access' = 'false'"),
+        "local path should default path-style=false: {ddl}"
+    );
+    assert!(
+        ddl.contains("'sink.delta.connection.maximum' = '500'"),
+        "missing connection.maximum: {ddl}"
+    );
+    assert!(
+        ddl.contains("'sink.delta.connection.timeout' = '200s'"),
+        "timeout should render as duration: {ddl}"
+    );
+    assert!(
+        ddl.contains("'sink.delta.attempts.maximum' = '20'"),
+        "missing attempts.maximum: {ddl}"
+    );
+    assert!(
+        !ddl.contains("rolling-policy") && !ddl.contains("autoOptimize"),
+        "removed Flink-only keys must not appear: {ddl}"
+    );
+
+    // Reject removed keys at CREATE time.
+    let bad = client
+        .no_query(&format!(
+            "CREATE STREAM {stream}_bad WITH (
+              'sink.type' = 'delta',
+              'sink.delta.path' = '{lake_path}/bad',
+              'source.table' = '{table}',
+              'delta.autoOptimize.optimizeWrite' = 'true'
+            )"
+        ))
+        .await;
+    assert!(bad.is_err(), "removed autoOptimize key should be rejected");
+
+    Ok(())
+}
+
+/// MinIO with full SQL-side S3 knobs (DDL credentials + duration timeout), no AWS_* env.
+#[tokio::test]
+async fn delta_minio_full_sql_config_write_verify() -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(e) = require_docker_stack().await {
+        eprintln!("SKIP delta MinIO full-config IT: {e}");
+        return Ok(());
+    }
+
+    const ROWS: usize = 2_000;
+    const FLUSH: usize = 1_000;
+
+    let table = unique_table("delta_full_src");
+    let stream = unique_table("delta_full_stream");
+    let prefix = unique_table("delta_full");
+    let s3_uri = format!("s3://{MINIO_BUCKET}/{prefix}");
+
+    let region_provider = RegionProviderChain::default_provider().or_else("us-east-1");
+    let creds = Credentials::new(
+        MINIO_ACCESS_KEY,
+        MINIO_SECRET_KEY,
+        None,
+        None,
+        "minio-hardcoded",
+    );
+    let shared = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .credentials_provider(creds)
+        .endpoint_url(MINIO_ENDPOINT)
+        .load()
+        .await;
+    let s3_config = aws_sdk_s3::config::Builder::from(&shared)
+        .force_path_style(true)
+        .build();
+    let s3_client = S3Client::from_conf(s3_config);
+
+    // Intentionally omit AWS_* env — credentials come from DDL only.
+    let mut inst_sender = MonotsInstance::new("delta_sink_minio_full_cfg")?;
+    let mut inst_recv = MonotsInstance::new("delta_sink_minio_full_cfg_recv")?;
+    inst_sender.start().await?;
+    inst_recv.start().await?;
+
+    let mut client_sender = inst_sender.authenticated_client().await?;
+    let mut client_recv = inst_recv.authenticated_client().await?;
+
+    let temp_dir = TempDir::new()?;
+    let download_path = temp_dir.path();
+    let receiver = unique_table("delta_full_dst");
+
+    client_sender
+        .no_query(&format!(
+            "CREATE TABLE {table} (time BIGINT NOT NULL, region VARCHAR, value BIGINT)"
+        ))
+        .await?;
+    client_recv
+        .no_query(&format!(
+            "CREATE TABLE {receiver} (time BIGINT NOT NULL, region VARCHAR, value BIGINT)"
+        ))
+        .await?;
+
+    client_sender
+        .no_query(&format!(
+            "CREATE STREAM {stream} WITH (
+              'sink.type' = 'delta',
+              'sink.delta.path' = '{s3_uri}',
+              'sink.delta.endpoint' = '{MINIO_ENDPOINT}',
+              'sink.delta.access.key' = '{MINIO_ACCESS_KEY}',
+              'sink.delta.secret.key' = '{MINIO_SECRET_KEY}',
+              'sink.delta.region' = 'us-east-1',
+              'sink.delta.path.style.access' = 'true',
+              'sink.delta.connection.maximum' = '64',
+              'sink.delta.connection.timeout' = '3 min',
+              'sink.delta.attempts.maximum' = '10',
+              'source.table' = '{table}',
+              'cdc.mode' = 'batch'
+            )"
+        ))
+        .await?;
+
+    let detail = client_sender
+        .query(&format!("SHOW STREAM {stream}"))
+        .await?;
+    let ddl = scalar_str_named(&detail, "create_statement");
+    assert!(
+        ddl.contains("'sink.delta.endpoint' = '{MINIO_ENDPOINT}'"),
+        "{ddl}"
+    );
+    assert!(
+        ddl.contains("'sink.delta.path.style.access' = 'true'"),
+        "{ddl}"
+    );
+    assert!(
+        ddl.contains("'sink.delta.connection.maximum' = '64'"),
+        "{ddl}"
+    );
+    assert!(
+        ddl.contains("'sink.delta.connection.timeout' = '3 min'"),
+        "duration must round-trip: {ddl}"
+    );
+    assert!(
+        ddl.contains("'sink.delta.attempts.maximum' = '10'"),
+        "{ddl}"
+    );
+    assert!(
+        ddl.contains(&format!("'sink.delta.access.key' = '{MINIO_ACCESS_KEY}'")),
+        "DDL credentials should appear in SHOW CREATE: {ddl}"
+    );
+
+    // Smaller closed loop than the 5k MinIO IT — config wiring is the focus.
+    let mut written = 0usize;
+    while written < ROWS {
+        let n = (ROWS - written).min(FLUSH);
+        let batch = metrics_batch(BASE_TS + written as i64, written as i64, n);
+        let rows = client_sender.write_batches(&table, vec![batch]).await?;
+        assert_eq!(rows, n as u64);
+        client_sender
+            .no_query(&format!("FLUSH TABLE {table}"))
+            .await?;
+        written += n;
+    }
+
+    wait_stream_files(
+        &mut client_sender,
+        &stream,
+        ROWS / FLUSH,
+        Duration::from_secs(180),
+    )
+    .await;
+
+    let expect_files_num = ROWS / FLUSH;
+    let prefix_slash = format!("{prefix}/");
+    let start = Instant::now();
+    let timeout = Duration::from_secs(180);
+    loop {
+        let list_objects = s3_client
+            .list_objects_v2()
+            .bucket(MINIO_BUCKET)
+            .prefix(&prefix)
+            .send()
+            .await?;
+        let files = list_objects.contents();
+        let parquet_files_count = files
+            .iter()
+            .filter(|o| o.key().unwrap_or_default().ends_with(".parquet"))
+            .count();
+        let log_files_count = files
+            .iter()
+            .filter(|o| {
+                let k = o.key().unwrap_or_default();
+                k.contains("_delta_log") && k.ends_with(".json")
+            })
+            .count();
+
+        if parquet_files_count >= expect_files_num && log_files_count >= expect_files_num {
+            for object in files {
+                let Some(key) = object.key() else {
+                    continue;
+                };
+                let relative_key = key
+                    .strip_prefix(&prefix_slash)
+                    .or_else(|| key.strip_prefix(&prefix))
+                    .unwrap_or(key)
+                    .trim_start_matches('/');
+                if relative_key.is_empty() {
+                    continue;
+                }
+                let local_file_path = download_path.join(relative_key);
+                if let Some(parent) = local_file_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let get = s3_client
+                    .get_object()
+                    .bucket(MINIO_BUCKET)
+                    .key(key)
+                    .send()
+                    .await?;
+                let bytes = get.body.collect().await?.into_bytes();
+                tokio::fs::write(&local_file_path, &bytes).await?;
+            }
+            break;
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "MinIO full-config incomplete: parquet={parquet_files_count}/{expect_files_num} \
+                 log={log_files_count}/{expect_files_num}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let loaded = client_recv
+        .no_query(&format!(
+            "LOAD PARQUET '{}' INTO {receiver}",
+            download_path.display()
+        ))
+        .await?;
+    assert_eq!(loaded, ROWS as u64);
+
+    let stats = client_recv
+        .query(&format!(
+            "SELECT COUNT(*) AS c, SUM(value) AS s, MIN(value) AS vmin, MAX(value) AS vmax \
+             FROM {receiver}"
+        ))
+        .await?;
+    let expected_c = ROWS as i64;
+    let expected_sum = (ROWS as i64 - 1) * ROWS as i64 / 2;
+    assert_eq!(scalar_i64_named(&stats, "c"), expected_c);
+    assert_eq!(scalar_i64_named(&stats, "s"), expected_sum);
+    assert_eq!(scalar_i64_named(&stats, "vmin"), 0);
+    assert_eq!(scalar_i64_named(&stats, "vmax"), expected_c - 1);
+
+    eprintln!("MinIO Delta full SQL config IT passed: {ROWS} rows");
+    Ok(())
+}
+
 /// MinIO path: MonoTS LOAD does not take S3 URIs yet, so download objects then LOAD locally.
+/// Credentials via process env (`AWS_*`); endpoint via DDL.
 #[tokio::test]
 async fn delta_minio_flush_1k_write_manual_download_verify(
 ) -> Result<(), Box<dyn std::error::Error>> {

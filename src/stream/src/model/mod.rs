@@ -15,6 +15,7 @@
 //! Pure data structures: stream definition, runtime metrics, pipeline events.
 
 pub mod def;
+pub mod delta_options;
 pub mod event;
 pub mod metrics;
 pub mod source_spec;
@@ -25,6 +26,7 @@ pub use def::{
     ensure_single_source_table, parse_stream_def, should_run_phase, should_run_stream, stream_plan,
     stream_worker_id, SinkConfig, StreamDef,
 };
+pub use delta_options::DeltaSinkOptions;
 pub use event::{DataEvent, IngressEvent, InsertArrow};
 pub use metrics::{
     ExecutionStep, MetricsRegistry, RuntimeStateRegistry, StreamMetrics, StreamRuntimeState,

@@ -86,7 +86,9 @@ Docker-backed tests call `docker compose` themselves when Docker is up. Set
 |-------------|------|-----------|
 | `stream_filesystem_sink` | local Parquet dir | 10k rows, flush every 1k, LOAD + compare |
 | `stream_delta_sink` (local) | Delta `_delta_log` on disk | flush every 1k, then LOAD + aggregate verify |
-| `stream_delta_sink` (MinIO) | `s3://` + `sink.delta.endpoint` | Docker MinIO; download objects then LOAD locally |
+| `stream_delta_sink` (local SHOW CREATE) | defaults materialization | asserts S3 client defaults + rejects removed keys |
+| `stream_delta_sink` (MinIO) | `s3://` + `sink.delta.endpoint` | Docker MinIO; env credentials; download then LOAD |
+| `stream_delta_sink` (MinIO full SQL) | full `sink.delta.*` DDL knobs | DDL credentials + `3 min` timeout; download then LOAD |
 | `stream_kafka_sink` | Kafka JSON | Docker Kafka; content-verify JSON rows |
 | `stream_sql_ddl` | — | CREATE / SHOW / DROP STREAM SQL surface |
 

@@ -14,16 +14,21 @@
 
 //! Persist stream definitions under `{data_dir}/streams/*.pb`.
 //!
-//! Per-stream async locks isolate writers. DashMap refs are never held across `.await`.
+//! DDL for a given stream name is fully serialized via a **fixed sharded lock pool**
+//! (no per-name lock map / leak). The async mutex is held across disk IO — tokio
+//! parks the task, not the worker thread — so TOCTOU lost-updates cannot occur.
 //! Parent-dir fsync after rename/unlink makes metadata durable across power loss.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use common::{Result, TsdbError};
@@ -34,11 +39,14 @@ use crate::control::meta::codec::{
 };
 use crate::model::StreamDef;
 
+/// Fixed lock shards — hash(stream_name) % N. Bounds memory under adversarial create storms.
+const NAME_LOCK_SHARDS: usize = 256;
+
 pub struct StreamStore {
     root: PathBuf,
     streams: DashMap<String, Versioned<StreamDef>>,
-    /// Per-stream serialize of mutate → disk → map.
-    name_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Fixed-size sharded async locks (not one Arc per stream name).
+    name_locks: Vec<Mutex<()>>,
     checkpoints: Arc<CheckpointStore>,
 }
 
@@ -47,24 +55,32 @@ impl StreamStore {
         let root = data_dir.join("streams");
         fs::create_dir_all(&root)
             .await
-            .map_err(|e| TsdbError::Storage(format!("Failed to create streams dir: {e}")))?;
+            .map_err(|e| TsdbError::storage_io(&root, e))?;
 
         let checkpoints_root = data_dir.join("sync_checkpoints");
         let checkpoints = CheckpointStore::open(checkpoints_root).await?;
 
+        let mut name_locks = Vec::with_capacity(NAME_LOCK_SHARDS);
+        for _ in 0..NAME_LOCK_SHARDS {
+            name_locks.push(Mutex::new(()));
+        }
+
         let store = Arc::new(Self {
             root,
             streams: DashMap::new(),
-            name_locks: DashMap::new(),
+            name_locks,
             checkpoints,
         });
         store.reload().await?;
         Ok(store)
     }
 
-    /// Clone the per-name lock Arc; drop the DashMap entry guard before awaiting.
-    fn get_name_lock(&self, name: &str) -> Arc<Mutex<()>> {
-        self.name_locks.entry(name.to_string()).or_default().clone()
+    /// Hash `name` onto a fixed lock shard and acquire it.
+    async fn acquire_lock(&self, name: &str) -> MutexGuard<'_, ()> {
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        let index = (hasher.finish() as usize) % self.name_locks.len();
+        self.name_locks[index].lock().await
     }
 
     async fn reload(&self) -> Result<()> {
@@ -75,32 +91,45 @@ impl StreamStore {
 
         let mut entries = fs::read_dir(&self.root)
             .await
-            .map_err(|e| TsdbError::Storage(format!("Failed to read streams dir: {e}")))?;
+            .map_err(|e| TsdbError::storage_io(&self.root, e))?;
 
+        let mut paths = Vec::new();
         while let Some(entry) = entries
             .next_entry()
             .await
-            .map_err(|e| TsdbError::Storage(e.to_string()))?
+            .map_err(|e| TsdbError::storage_io(&self.root, e))?
         {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("pb") {
-                continue;
+            if path.extension().and_then(|s| s.to_str()) == Some("pb") {
+                paths.push(path);
             }
+        }
 
-            let bytes = fs::read(&path).await.map_err(|e| {
-                TsdbError::Storage(format!("Failed to read stream def {}: {e}", path.display()))
-            })?;
+        // Concurrent decode accelerates cold start when many stream defs exist.
+        let mut join_set = JoinSet::new();
+        for path in paths {
+            join_set.spawn(async move {
+                let bytes = fs::read(&path)
+                    .await
+                    .map_err(|e| TsdbError::storage_io(&path, e))?;
+                let v = decode_versioned_stream_def(&bytes).map_err(|e| {
+                    TsdbError::Storage(format!(
+                        "Protobuf decode failed for {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                Ok::<_, TsdbError>((path, v))
+            });
+        }
 
-            let v = decode_versioned_stream_def(&bytes).map_err(|e| {
-                TsdbError::Storage(format!(
-                    "Protobuf decode failed for {}: {e}",
-                    path.display()
-                ))
-            })?;
+        while let Some(joined) = join_set.join_next().await {
+            let (path, v) = joined
+                .map_err(|e| TsdbError::Storage(format!("stream reload join failed: {e}")))??;
 
             if v.disk_schema_version > STREAM_SCHEMA_VERSION {
                 warn!(
                     stream = %v.inner.name,
+                    path = %path.display(),
                     disk_schema_version = v.disk_schema_version,
                     local_schema_version = STREAM_SCHEMA_VERSION,
                     "Loaded stream written by a newer binary; updates will be refused until upgrade"
@@ -134,8 +163,9 @@ impl StreamStore {
         crate::model::def::ensure_single_source_table(&def)?;
 
         let name = def.name.clone();
-        let lock_arc = self.get_name_lock(&name);
-        let _guard = lock_arc.lock().await;
+        // Hold the shard lock for the entire mutate → disk → map path (no TOCTOU).
+        // tokio::Mutex parks this task across .await; it does not stall worker threads.
+        let _guard = self.acquire_lock(&name).await;
 
         let v = if let Some(existing) = self.streams.get(&name) {
             if !existing.can_rewrite() {
@@ -154,14 +184,14 @@ impl StreamStore {
             Versioned::fresh(def)
         };
 
-        self.persist_versioned(&v).await?;
+        let tmp_path = self.write_versioned_tmp(&v).await?;
+        self.publish_tmp(&tmp_path, &name).await?;
         self.streams.insert(name, Versioned::fresh(v.inner));
         Ok(())
     }
 
     pub async fn update(&self, name: &str, mutator: impl FnOnce(&mut StreamDef)) -> Result<()> {
-        let lock_arc = self.get_name_lock(name);
-        let _guard = lock_arc.lock().await;
+        let _guard = self.acquire_lock(name).await;
 
         let mut v = self
             .streams
@@ -179,15 +209,16 @@ impl StreamStore {
         mutator(&mut v.inner);
         crate::model::def::ensure_single_source_table(&v.inner)?;
 
-        self.persist_versioned(&v).await?;
+        let tmp_path = self.write_versioned_tmp(&v).await?;
+        self.publish_tmp(&tmp_path, name).await?;
         self.streams
             .insert(name.to_string(), Versioned::fresh(v.inner));
         Ok(())
     }
 
-    async fn persist_versioned(&self, v: &Versioned<StreamDef>) -> Result<()> {
-        let path = self.stream_path(&v.inner.name)?;
-        let tmp_path = path.with_extension("pb.tmp");
+    async fn write_versioned_tmp(&self, v: &Versioned<StreamDef>) -> Result<PathBuf> {
+        // Same-name writers are serialized by the shard lock; simple tmp name is enough.
+        let tmp_path = self.root.join(format!("{}.pb.tmp", v.inner.name));
 
         let v_clone = v.clone();
         let bytes = tokio::task::spawn_blocking(move || encode_versioned_stream_def(&v_clone))
@@ -201,57 +232,42 @@ impl StreamStore {
                 .truncate(true)
                 .open(&tmp_path)
                 .await
-                .map_err(|e| {
-                    TsdbError::Storage(format!("Stream create {}: {e}", tmp_path.display()))
-                })?;
-            f.write_all(&bytes).await.map_err(|e| {
-                TsdbError::Storage(format!("Stream write {}: {e}", tmp_path.display()))
-            })?;
-            f.sync_all().await.map_err(|e| {
-                TsdbError::Storage(format!("Stream sync {}: {e}", tmp_path.display()))
-            })?;
+                .map_err(|e| TsdbError::storage_io(&tmp_path, e))?;
+            f.write_all(&bytes)
+                .await
+                .map_err(|e| TsdbError::storage_io(&tmp_path, e))?;
+            f.sync_all()
+                .await
+                .map_err(|e| TsdbError::storage_io(&tmp_path, e))?;
         }
+        Ok(tmp_path)
+    }
 
-        fs::rename(&tmp_path, &path).await.map_err(|e| {
-            TsdbError::Storage(format!(
-                "Atomic rename {} → {}: {e}",
-                tmp_path.display(),
-                path.display()
-            ))
-        })?;
+    async fn publish_tmp(&self, tmp_path: &Path, name: &str) -> Result<()> {
+        let path = self.stream_path(name)?;
+        fs::rename(tmp_path, &path)
+            .await
+            .map_err(|e| TsdbError::storage_io(&path, e))?;
         self.sync_directory(&self.root).await?;
         Ok(())
     }
 
     pub async fn remove(&self, name: &str) -> Result<()> {
-        let lock_arc = self.get_name_lock(name);
-        let _guard = lock_arc.lock().await;
+        let _guard = self.acquire_lock(name).await;
 
-        let removed = self.streams.remove(name);
-        let _ = removed;
+        self.streams.remove(name);
         let path = self.stream_path(name)?;
 
         match fs::remove_file(&path).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(TsdbError::Storage(format!(
-                    "Remove stream file {}: {e}",
-                    path.display()
-                )));
-            }
+            Err(e) => return Err(TsdbError::storage_io(&path, e)),
         }
         self.sync_directory(&self.root).await?;
 
         // Checkpoint identity is always `stream::<name>` (see stream_worker_id).
         let worker = format!("stream::{name}");
         self.checkpoints.delete(name, &worker).await?;
-
-        drop(_guard);
-        drop(lock_arc);
-        // Drop map entry only when no other task still holds the Arc (avoids orphan locks).
-        self.name_locks
-            .remove_if(name, |_, arc| Arc::strong_count(arc) == 1);
         Ok(())
     }
 
@@ -313,6 +329,7 @@ mod tests {
             sink_config: crate::model::SinkConfig::Delta {
                 path: "/tmp/x".into(),
                 endpoint: None,
+                options: crate::model::DeltaSinkOptions::default(),
             },
             created_at_ms: 1,
             auto_end: false,
@@ -358,6 +375,7 @@ mod tests {
                 d.sink_config = crate::model::SinkConfig::Delta {
                     path: "/tmp/x".into(),
                     endpoint: None,
+                    options: crate::model::DeltaSinkOptions::default(),
                 };
             })
             .await
@@ -399,6 +417,7 @@ mod tests {
                 d.sink_config = crate::model::SinkConfig::Delta {
                     path: format!("/tmp/a{i}"),
                     endpoint: None,
+                    options: crate::model::DeltaSinkOptions::default(),
                 };
                 s1.put(d).await.unwrap();
             }
@@ -409,6 +428,7 @@ mod tests {
                 d.sink_config = crate::model::SinkConfig::Delta {
                     path: format!("/tmp/b{i}"),
                     endpoint: None,
+                    options: crate::model::DeltaSinkOptions::default(),
                 };
                 s2.put(d).await.unwrap();
             }
@@ -425,5 +445,63 @@ mod tests {
         let bytes = std::fs::read(tmp.path().join("streams").join("s1.pb")).unwrap();
         let on_disk = decode_versioned_stream_def(&bytes).unwrap().inner;
         assert_eq!(on_disk.sink_path(), def.sink_path());
+    }
+
+    #[tokio::test]
+    async fn concurrent_update_does_not_lose_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StreamStore::open(tmp.path()).await.unwrap();
+        store.put(sample("s1")).await.unwrap();
+
+        let s1 = Arc::clone(&store);
+        let s2 = Arc::clone(&store);
+        let t1 = tokio::spawn(async move {
+            for i in 0..30 {
+                s1.update("s1", |d| {
+                    d.sink_config = crate::model::SinkConfig::Delta {
+                        path: format!("/tmp/a{i}"),
+                        endpoint: None,
+                        options: crate::model::DeltaSinkOptions::default(),
+                    };
+                })
+                .await
+                .unwrap();
+            }
+        });
+        let t2 = tokio::spawn(async move {
+            for i in 0..30 {
+                s2.update("s1", |d| {
+                    d.sink_config = crate::model::SinkConfig::Delta {
+                        path: format!("/tmp/b{i}"),
+                        endpoint: None,
+                        options: crate::model::DeltaSinkOptions::default(),
+                    };
+                })
+                .await
+                .unwrap();
+            }
+        });
+        t1.await.unwrap();
+        t2.await.unwrap();
+
+        let def = store.get("s1").unwrap();
+        let bytes = std::fs::read(tmp.path().join("streams").join("s1.pb")).unwrap();
+        let on_disk = decode_versioned_stream_def(&bytes).unwrap().inner;
+        assert_eq!(
+            on_disk.sink_path(),
+            def.sink_path(),
+            "memory and disk must agree after concurrent updates"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_io_preserves_error_kind() {
+        let bogus = std::path::Path::new("/definitely/not/a/real/stream/dir");
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let wrapped = TsdbError::storage_io(bogus, err);
+        assert_eq!(wrapped.io_kind(), Some(std::io::ErrorKind::NotFound));
+        assert!(wrapped.to_string().contains("storage IO error"));
+        use std::error::Error as _;
+        assert!(wrapped.source().is_some());
     }
 }

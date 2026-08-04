@@ -37,6 +37,7 @@ pub enum ResolvedSinkConfig {
         path: String,
         table: Option<String>,
         endpoint: Option<String>,
+        options: crate::model::DeltaSinkOptions,
     },
 }
 
@@ -72,14 +73,17 @@ impl ResolvedSinkConfig {
                 let path = cfg.sink_path().filter(|s| !s.is_empty()).ok_or_else(|| {
                     TsdbError::Query("delta sink requires sink.delta.path".into())
                 })?;
-                let endpoint = match &def.sink_config {
-                    crate::model::SinkConfig::Delta { endpoint, .. } => endpoint.clone(),
-                    _ => None,
+                let (endpoint, options) = match &def.sink_config {
+                    crate::model::SinkConfig::Delta {
+                        endpoint, options, ..
+                    } => (endpoint.clone(), options.clone()),
+                    _ => (None, crate::model::DeltaSinkOptions::default()),
                 };
                 Ok(Self::Delta {
                     path: path.to_string(),
                     table: def.source_tables.first().cloned(),
                     endpoint,
+                    options,
                 })
             }
         }
@@ -141,6 +145,7 @@ mod tests {
             ConnectorType::Delta => SinkConfig::Delta {
                 path: "/tmp/lake".into(),
                 endpoint: None,
+                options: crate::model::DeltaSinkOptions::default(),
             },
             ConnectorType::Filesystem => SinkConfig::Filesystem {
                 path: "/tmp/fs".into(),
@@ -180,6 +185,7 @@ mod tests {
         def.sink_config = SinkConfig::Delta {
             path: String::new(),
             endpoint: None,
+            options: crate::model::DeltaSinkOptions::default(),
         };
         assert!(validate_sink(&def).is_err());
     }

@@ -334,10 +334,17 @@ pub fn format_stream_ddl(def: &StreamDef) -> String {
     ];
 
     match &def.sink_config {
-        crate::model::SinkConfig::Delta { path, endpoint } => {
+        crate::model::SinkConfig::Delta {
+            path,
+            endpoint,
+            options,
+        } => {
             parts.push(format!("'sink.delta.path' = '{path}'"));
             if let Some(ep) = endpoint.as_ref().filter(|s| !s.is_empty()) {
                 parts.push(format!("'sink.delta.endpoint' = '{ep}'"));
+            }
+            for (k, v) in options.ddl_pairs(endpoint.as_deref()) {
+                parts.push(format!("'{k}' = '{v}'"));
             }
         }
         crate::model::SinkConfig::Filesystem { path } => {
@@ -373,5 +380,40 @@ pub async fn start_stream_if_ready(ctx: &StreamDdlContext, stream_name: &str) {
     };
     if ctx.streams.get(stream_name).is_some() {
         let _ = engine.start_stream(rt.clone(), stream_name).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{DeltaSinkOptions, SinkConfig, StreamDef};
+    use common::StreamCaptureMode;
+
+    #[test]
+    fn format_delta_ddl_always_emits_industrial_defaults() {
+        let def = StreamDef {
+            name: "metrics_out".into(),
+            source_tables: vec!["metrics".into()],
+            capture_mode: StreamCaptureMode::Batch,
+            sink_config: SinkConfig::Delta {
+                path: "s3://b/t".into(),
+                endpoint: Some("http://127.0.0.1:9000".into()),
+                options: DeltaSinkOptions::default(),
+            },
+            created_at_ms: 0,
+            auto_end: false,
+        };
+        let ddl = format_stream_ddl(&def);
+        assert!(ddl.contains("'sink.delta.path' = 's3://b/t'"));
+        assert!(ddl.contains("'sink.delta.endpoint' = 'http://127.0.0.1:9000'"));
+        assert!(ddl.contains("'sink.delta.region' = 'us-east-1'"));
+        assert!(ddl.contains("'sink.delta.path.style.access' = 'true'"));
+        assert!(ddl.contains("'sink.delta.connection.maximum' = '500'"));
+        assert!(ddl.contains("'sink.delta.connection.timeout' = '200s'"));
+        assert!(ddl.contains("'sink.delta.attempts.maximum' = '20'"));
+        assert!(!ddl.contains("rolling-policy"));
+        assert!(!ddl.contains("autoOptimize"));
+        assert!(!ddl.contains("logRetentionDuration"));
+        assert!(!ddl.contains("deletedFileRetentionDuration"));
     }
 }

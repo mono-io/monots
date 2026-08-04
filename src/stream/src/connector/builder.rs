@@ -60,7 +60,8 @@ pub fn build_sink_with_engine(
             path,
             table,
             endpoint,
-        } => Ok(Box::new(DeltaSink::new(path, table, endpoint))),
+            options,
+        } => Ok(Box::new(DeltaSink::new(path, table, endpoint, options))),
     }
 }
 
@@ -100,6 +101,7 @@ mod tests {
             sink_config: SinkConfig::Delta {
                 path: "/tmp/lake".into(),
                 endpoint: None,
+                options: crate::model::DeltaSinkOptions::default(),
             },
             capture_mode: common::StreamCaptureMode::Batch,
             ..kafka.clone()

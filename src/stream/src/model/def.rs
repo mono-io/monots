@@ -16,6 +16,8 @@
 
 use common::{ConnectorType, Result, StreamCaptureMode, TsdbError};
 
+use super::delta_options::{DeltaSinkOptions, DELTA_OPTION_KEYS};
+
 /// Pure stream configuration (persisted in `streams/*.pb`).
 #[derive(Debug, Clone)]
 pub struct StreamDef {
@@ -39,6 +41,8 @@ pub enum SinkConfig {
     Delta {
         path: String,
         endpoint: Option<String>,
+        /// Industrial S3 / table-property defaults (always filled on parse).
+        options: DeltaSinkOptions,
     },
     /// Local directory export of CDC Parquet files.
     Filesystem { path: String },
@@ -89,6 +93,13 @@ impl SinkConfig {
             _ => None,
         }
     }
+
+    pub fn delta_options(&self) -> Option<&DeltaSinkOptions> {
+        match self {
+            Self::Delta { options, .. } => Some(options),
+            _ => None,
+        }
+    }
 }
 
 impl StreamDef {
@@ -118,6 +129,10 @@ impl StreamDef {
 
     pub fn sink_endpoint(&self) -> Option<&str> {
         self.sink_config.sink_endpoint()
+    }
+
+    pub fn delta_options(&self) -> Option<&DeltaSinkOptions> {
+        self.sink_config.delta_options()
     }
 
     /// Validation enforcing single source table binding.
@@ -155,7 +170,7 @@ use std::collections::HashMap;
 
 use crate::connector::{connector_capture_mode, connector_default_format, validate_sink};
 
-/// Prefer connector-prefixed keys (`sink.delta.path`), fall back to legacy flat keys (`sink.path`).
+/// Look up the first non-empty value among candidate DDL keys.
 fn opt_keyed<'a>(options: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
     for k in keys {
         if let Some(v) = options.get(*k) {
@@ -171,12 +186,38 @@ fn has_any_key(options: &HashMap<String, String>, keys: &[&str]) -> bool {
     keys.iter().any(|k| options.contains_key(*k))
 }
 
+/// Flat / alias keys that are not part of the v1 DDL surface.
+const REJECTED_LEGACY_KEYS: &[&str] = &[
+    "sink.path",
+    "sink.endpoint",
+    "sink.fs.path",
+    "sink.brokers",
+    "sink.topic",
+];
+
+fn reject_legacy_keys(options: &HashMap<String, String>) -> Result<()> {
+    let present: Vec<&str> = REJECTED_LEGACY_KEYS
+        .iter()
+        .copied()
+        .filter(|k| options.contains_key(*k))
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    Err(TsdbError::Query(format!(
+        "unsupported options {} (use sink.delta.|sink.filesystem.|sink.kafka. prefixed keys)",
+        present.join(", ")
+    )))
+}
+
 fn reject_foreign_sink_keys(
     connector: ConnectorType,
     options: &HashMap<String, String>,
 ) -> Result<()> {
+    reject_legacy_keys(options)?;
+
     let delta_keys = ["sink.delta.path", "sink.delta.endpoint"];
-    let fs_keys = ["sink.filesystem.path", "sink.fs.path"];
+    let fs_keys = ["sink.filesystem.path"];
     let kafka_keys = ["sink.kafka.brokers", "sink.kafka.topic"];
 
     let bad = match connector {
@@ -195,12 +236,11 @@ fn reject_foreign_sink_keys(
             if has_any_key(options, &delta_keys) {
                 v.extend_from_slice(&delta_keys);
             }
+            if has_any_key(options, DELTA_OPTION_KEYS) {
+                v.extend_from_slice(DELTA_OPTION_KEYS);
+            }
             if has_any_key(options, &kafka_keys) {
                 v.extend_from_slice(&kafka_keys);
-            }
-            // legacy flat endpoint also belongs to delta only
-            if options.contains_key("sink.endpoint") {
-                v.push("sink.endpoint");
             }
             v
         }
@@ -209,17 +249,11 @@ fn reject_foreign_sink_keys(
             if has_any_key(options, &delta_keys) {
                 v.extend_from_slice(&delta_keys);
             }
+            if has_any_key(options, DELTA_OPTION_KEYS) {
+                v.extend_from_slice(DELTA_OPTION_KEYS);
+            }
             if has_any_key(options, &fs_keys) {
                 v.extend_from_slice(&fs_keys);
-            }
-            if options.contains_key("sink.endpoint") || options.contains_key("sink.path") {
-                // flat path/endpoint are not kafka options (kafka uses brokers/topic)
-                if options.contains_key("sink.endpoint") {
-                    v.push("sink.endpoint");
-                }
-                if options.contains_key("sink.path") {
-                    v.push("sink.path");
-                }
             }
             v
         }
@@ -289,10 +323,10 @@ pub fn parse_stream_def(
 
     let sink_config = match connector_type {
         ConnectorType::Kafka => {
-            let brokers = opt_keyed(options, &["sink.kafka.brokers", "sink.brokers"])
+            let brokers = opt_keyed(options, &["sink.kafka.brokers"])
                 .unwrap_or_default()
                 .to_string();
-            let topic = opt_keyed(options, &["sink.kafka.topic", "sink.topic"])
+            let topic = opt_keyed(options, &["sink.kafka.topic"])
                 .unwrap_or_default()
                 .to_string();
             if brokers.is_empty() || topic.is_empty() {
@@ -307,22 +341,23 @@ pub fn parse_stream_def(
             }
         }
         ConnectorType::Delta => {
-            let path = opt_keyed(options, &["sink.delta.path", "sink.path"])
+            let path = opt_keyed(options, &["sink.delta.path"])
                 .ok_or_else(|| TsdbError::Query("delta sink requires sink.delta.path".into()))?
                 .to_string();
-            let endpoint = opt_keyed(options, &["sink.delta.endpoint", "sink.endpoint"])
-                .map(|s| s.to_string());
-            SinkConfig::Delta { path, endpoint }
+            let endpoint = opt_keyed(options, &["sink.delta.endpoint"]).map(|s| s.to_string());
+            let delta_opts = DeltaSinkOptions::from_ddl(options)?;
+            SinkConfig::Delta {
+                path,
+                endpoint,
+                options: delta_opts,
+            }
         }
         ConnectorType::Filesystem => {
-            let path = opt_keyed(
-                options,
-                &["sink.filesystem.path", "sink.fs.path", "sink.path"],
-            )
-            .ok_or_else(|| {
-                TsdbError::Query("filesystem sink requires sink.filesystem.path".into())
-            })?
-            .to_string();
+            let path = opt_keyed(options, &["sink.filesystem.path"])
+                .ok_or_else(|| {
+                    TsdbError::Query("filesystem sink requires sink.filesystem.path".into())
+                })?
+                .to_string();
             SinkConfig::Filesystem { path }
         }
     };
@@ -423,7 +458,7 @@ mod tests {
             &opts(&[
                 ("sink.type", "delta"),
                 ("source.table", "t0"),
-                ("sink.path", "/tmp/x"),
+                ("sink.delta.path", "/tmp/x"),
             ]),
             0,
         )
@@ -439,7 +474,7 @@ mod tests {
             &opts(&[
                 ("sink.type", "delta"),
                 ("source.table", "t0,t1"),
-                ("sink.path", "/tmp/x"),
+                ("sink.delta.path", "/tmp/x"),
             ]),
             0,
         )
@@ -452,7 +487,7 @@ mod tests {
     fn source_table_is_required() {
         let err = parse_stream_def(
             "s".into(),
-            &opts(&[("sink.type", "delta"), ("sink.path", "/tmp/x")]),
+            &opts(&[("sink.type", "delta"), ("sink.delta.path", "/tmp/x")]),
             0,
         )
         .unwrap_err()
@@ -468,7 +503,7 @@ mod tests {
                 &opts(&[
                     ("sink.type", connector),
                     ("source.table", "t"),
-                    ("sink.path", "/tmp/x"),
+                    ("sink.delta.path", "/tmp/x"),
                 ]),
                 0,
             )
@@ -485,7 +520,7 @@ mod tests {
             &opts(&[
                 ("sink.type", "delta"),
                 ("source.table", "t"),
-                ("sink.path", "/tmp/x"),
+                ("sink.delta.path", "/tmp/x"),
             ]),
             0,
         )
@@ -501,7 +536,7 @@ mod tests {
             &opts(&[
                 ("sink.type", "filesystem"),
                 ("source.table", "t"),
-                ("sink.path", "/tmp/fs"),
+                ("sink.filesystem.path", "/tmp/fs"),
             ]),
             0,
         )
@@ -517,8 +552,8 @@ mod tests {
             &opts(&[
                 ("sink.type", "kafka"),
                 ("source.table", "t"),
-                ("sink.brokers", "localhost:9092"),
-                ("sink.topic", "t"),
+                ("sink.kafka.brokers", "localhost:9092"),
+                ("sink.kafka.topic", "t"),
             ]),
             0,
         )
@@ -534,8 +569,8 @@ mod tests {
             &opts(&[
                 ("sink.type", "kafka"),
                 ("source.table", "t"),
-                ("sink.brokers", "localhost:9092"),
-                ("sink.topic", "t"),
+                ("sink.kafka.brokers", "localhost:9092"),
+                ("sink.kafka.topic", "t"),
                 ("sink.format", "json"),
                 ("cdc.mode", "batch"),
             ]),
@@ -570,8 +605,8 @@ mod tests {
             &opts(&[
                 ("sink.type", "kafka"),
                 ("source.table", "t"),
-                ("sink.brokers", "localhost:9092"),
-                ("sink.topic", "t"),
+                ("sink.kafka.brokers", "localhost:9092"),
+                ("sink.kafka.topic", "t"),
                 ("cdc.mode", "batch"),
             ]),
             0,
@@ -584,7 +619,7 @@ mod tests {
             &opts(&[
                 ("sink.type", "delta"),
                 ("source.table", "t"),
-                ("sink.path", "/tmp/x"),
+                ("sink.delta.path", "/tmp/x"),
                 ("cdc.mode", "hybrid"),
             ]),
             0,
@@ -644,17 +679,61 @@ mod tests {
             "DDL sink.delta.endpoint should bind onto DeltaSink"
         );
         match &def.sink_config {
-            SinkConfig::Delta { path, endpoint } => {
+            SinkConfig::Delta {
+                path,
+                endpoint,
+                options,
+            } => {
                 assert_eq!(path, "s3://bucket/metrics");
                 assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+                assert_eq!(options.region, crate::model::delta_options::DEFAULT_REGION);
+                assert_eq!(
+                    options.connection_maximum,
+                    crate::model::delta_options::DEFAULT_CONNECTION_MAXIMUM
+                );
             }
             other => panic!("expected Delta sink, got {other:?}"),
         }
     }
 
     #[test]
-    fn legacy_flat_sink_keys_still_parse() {
+    fn delta_sink_defaults_always_materialized() {
         let def = parse_stream_def(
+            "s".into(),
+            &opts(&[
+                ("sink.type", "delta"),
+                ("source.table", "t"),
+                ("sink.delta.path", "/tmp/x"),
+            ]),
+            0,
+        )
+        .unwrap();
+        let opts = def.delta_options().expect("delta options");
+        assert_eq!(opts.region, "us-east-1");
+        assert_eq!(opts.connection_timeout_ms, 200_000);
+        assert_eq!(opts.attempts_maximum, 20);
+        assert_eq!(opts.connection_maximum, 500);
+    }
+
+    #[test]
+    fn delta_connection_timeout_parses_sql_duration() {
+        let def = parse_stream_def(
+            "s".into(),
+            &opts(&[
+                ("sink.type", "delta"),
+                ("source.table", "t"),
+                ("sink.delta.path", "/tmp/x"),
+                ("sink.delta.connection.timeout", "3 min"),
+            ]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(def.delta_options().unwrap().connection_timeout_ms, 180_000);
+    }
+
+    #[test]
+    fn flat_legacy_sink_keys_are_rejected() {
+        let err = parse_stream_def(
             "s".into(),
             &opts(&[
                 ("sink.type", "delta"),
@@ -664,28 +743,13 @@ mod tests {
             ]),
             0,
         )
-        .unwrap();
-        assert_eq!(def.sink_path(), Some("s3://b/legacy"));
-        assert_eq!(def.sink_endpoint(), Some("http://legacy"));
-    }
-
-    #[test]
-    fn prefixed_keys_win_over_legacy() {
-        let def = parse_stream_def(
-            "s".into(),
-            &opts(&[
-                ("sink.type", "delta"),
-                ("source.table", "t"),
-                ("sink.delta.path", "s3://b/new"),
-                ("sink.path", "s3://b/old"),
-                ("sink.delta.endpoint", "http://new"),
-                ("sink.endpoint", "http://old"),
-            ]),
-            0,
-        )
-        .unwrap();
-        assert_eq!(def.sink_path(), Some("s3://b/new"));
-        assert_eq!(def.sink_endpoint(), Some("http://new"));
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unsupported options"), "{err}");
+        assert!(
+            err.contains("sink.path") || err.contains("sink.endpoint"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -730,7 +794,7 @@ mod tests {
             &opts(&[
                 ("sink.type", "delta"),
                 ("source.table", "t"),
-                ("sink.path", "/tmp/x"),
+                ("sink.delta.path", "/tmp/x"),
                 ("cdc.mode", "log"),
             ]),
             0,
@@ -748,7 +812,7 @@ mod tests {
             &opts(&[
                 ("sink.type", "delta"),
                 ("source.table", "t"),
-                ("sink.path", "/tmp/x"),
+                ("sink.delta.path", "/tmp/x"),
             ]),
             0,
         )
@@ -765,6 +829,7 @@ mod tests {
             sink_config: SinkConfig::Delta {
                 path: "/tmp/x".into(),
                 endpoint: None,
+                options: DeltaSinkOptions::default(),
             },
             created_at_ms: 0,
             auto_end: false,
@@ -787,8 +852,8 @@ mod tests {
             &opts(&[
                 ("sink.type", "kafka"),
                 ("source.table", "t"),
-                ("sink.brokers", "localhost:9092"),
-                ("sink.topic", "t"),
+                ("sink.kafka.brokers", "localhost:9092"),
+                ("sink.kafka.topic", "t"),
             ]),
             0,
         )
@@ -811,7 +876,7 @@ mod tests {
             &opts(&[
                 ("sink.type", "delta"),
                 ("source.table", "t"),
-                ("sink.path", "/tmp/x"),
+                ("sink.delta.path", "/tmp/x"),
                 ("cdc.to_timestamp", "100"),
             ]),
             0,
@@ -827,7 +892,7 @@ mod tests {
             &opts(&[
                 ("sink.type", "delta"),
                 ("source.table", "t"),
-                ("sink.path", "/tmp/x"),
+                ("sink.delta.path", "/tmp/x"),
                 ("cdc.auto_end", "true"),
             ]),
             0,

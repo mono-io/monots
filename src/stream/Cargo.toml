@@ -29,6 +29,9 @@ reqwest = { workspace = true }
 prost = { workspace = true }
 crc32fast = { workspace = true }
 futures = "0.3"
+thiserror = { workspace = true }
+rand = "0.8"
+bytes = { workspace = true }
 # `curl` is required: librdkafka 2.12.x (via rdkafka-sys 4.10) still includes
 # curl/curl.h when WITH_CURL=0 due to an `#ifdef WITH_OAUTHBEARER_OIDC` bug.
 # See https://github.com/fede1024/rust-rdkafka/issues/829

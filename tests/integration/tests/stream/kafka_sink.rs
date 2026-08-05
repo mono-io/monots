@@ -194,10 +194,9 @@ async fn wait_stream_not_failed(client: &mut sdk::Client, stream: &str) {
 
 #[tokio::test]
 async fn kafka_sink_flush_1k_write_10k_consumable() {
-    if let Err(e) = require_docker_stack().await {
-        eprintln!("SKIP kafka IT: {e}");
-        return;
-    }
+    require_docker_stack()
+        .await
+        .expect("Docker Kafka/MinIO stack required for kafka sink IT");
 
     let table = unique_table("kafka_src");
     let stream = unique_table("kafka_stream");
@@ -297,10 +296,9 @@ async fn kafka_sink_flush_1k_write_10k_consumable() {
 /// (count, uniqueness, region split, key↔value consistency).
 #[tokio::test]
 async fn kafka_sink_keyed_tuning_complete() {
-    if let Err(e) = require_docker_stack().await {
-        eprintln!("SKIP kafka keyed IT: {e}");
-        return;
-    }
+    require_docker_stack()
+        .await
+        .expect("Docker Kafka/MinIO stack required for kafka keyed IT");
 
     const ROWS: usize = 4_000;
     const FLUSH: usize = 1_000;

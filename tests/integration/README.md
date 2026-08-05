@@ -60,7 +60,7 @@ tests/integration/
 ## Run
 
 ```bash
-# From repo root — all ITs (Docker-backed tests skip if Docker is unavailable)
+# From repo root — all ITs (Docker-backed stream sinks require Docker)
 make integration-test
 
 # Or directly
@@ -77,8 +77,7 @@ cd tests/integration && make test-recovery
 cd tests/integration && make test CARGO_TEST_ARGS="--test write_dedup"
 ```
 
-Docker-backed tests call `docker compose` themselves when Docker is up. Set
-`MONOTS_IT_SKIP_DOCKER=1` to force-skip them.
+Docker-backed Kafka / MinIO stream tests **fail** if Docker is unavailable (they call `docker compose` and wait for ports). Start the stack with `make docker-up` or let tests bring it up themselves.
 
 ## Stream sink coverage
 

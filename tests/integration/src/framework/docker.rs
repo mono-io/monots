@@ -180,10 +180,7 @@ pub fn stack_down() {
     let _ = compose_run(&["down", "-v", "--remove-orphans"]);
 }
 
-/// Skip-friendly guard used at the top of Docker-backed tests.
+/// Fail hard unless Kafka + MinIO compose stack is up (no soft-skip).
 pub async fn require_docker_stack() -> Result<(), String> {
-    if std::env::var_os("MONOTS_IT_SKIP_DOCKER").is_some() {
-        return Err("skipped: MONOTS_IT_SKIP_DOCKER is set".into());
-    }
     ensure_stack_up().await
 }

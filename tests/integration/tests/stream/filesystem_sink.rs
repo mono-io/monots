@@ -449,10 +449,9 @@ async fn filesystem_sink_file_uri_export_load_complete() {
 /// Filesystem sink to MinIO (`s3://`) — download objects, LOAD, verify full integrity.
 #[tokio::test]
 async fn filesystem_sink_minio_export_load_complete() {
-    if let Err(e) = require_docker_stack().await {
-        eprintln!("SKIP filesystem MinIO IT: {e}");
-        return;
-    }
+    require_docker_stack()
+        .await
+        .expect("Docker Kafka/MinIO stack required for filesystem MinIO IT");
 
     const ROWS: usize = 2_000;
     const FLUSH: usize = 1_000;

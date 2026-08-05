@@ -334,10 +334,7 @@ async fn delta_local_show_create_emits_s3_client_defaults() -> Result<(), Box<dy
 /// MinIO with full SQL-side S3 knobs (DDL credentials + duration timeout), no AWS_* env.
 #[tokio::test]
 async fn delta_minio_full_sql_config_write_verify() -> Result<(), Box<dyn std::error::Error>> {
-    if let Err(e) = require_docker_stack().await {
-        eprintln!("SKIP delta MinIO full-config IT: {e}");
-        return Ok(());
-    }
+    require_docker_stack().await?;
 
     const ROWS: usize = 2_000;
     const FLUSH: usize = 1_000;
@@ -414,7 +411,7 @@ async fn delta_minio_full_sql_config_write_verify() -> Result<(), Box<dyn std::e
         .await?;
     let ddl = scalar_str_named(&detail, "create_statement");
     assert!(
-        ddl.contains("'sink.delta.endpoint' = '{MINIO_ENDPOINT}'"),
+        ddl.contains(&format!("'sink.delta.endpoint' = '{MINIO_ENDPOINT}'")),
         "{ddl}"
     );
     assert!(
@@ -550,10 +547,7 @@ async fn delta_minio_full_sql_config_write_verify() -> Result<(), Box<dyn std::e
 #[tokio::test]
 async fn delta_minio_flush_1k_write_manual_download_verify(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Err(e) = require_docker_stack().await {
-        eprintln!("SKIP delta MinIO IT: {e}");
-        return Ok(());
-    }
+    require_docker_stack().await?;
 
     let table = unique_table("delta_s3_src");
     let stream = unique_table("delta_s3_stream");

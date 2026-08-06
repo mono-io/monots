@@ -361,7 +361,7 @@ mod tests {
         drop(log);
         let reopened = WalCommitLog::open(&path).unwrap();
         let map = reopened.load().unwrap();
-        assert!(map.get("s1").is_none());
+        assert!(!map.contains_key("s1"));
         assert_eq!(map.get("s2"), Some(&20));
     }
 

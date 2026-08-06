@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Open-source multi-arch build + package.
+#
+# Runs on EVERY pull_request / push to main|master (compile gate, no tag needed).
+#
+# Publishing a GitHub Release (with tag):
+#   1) Prefer Actions → Package → Run workflow → enable "publish_release"
+#      → reads version from Cargo.toml, builds all arches, creates tag v<version>,
+#        attaches dist/monots-<version>-<triple>.{tar.gz,zip} to the Release.
+#   2) Or push tag v* manually (must match Cargo.toml version).
+#
+# Artifacts: dist/monots-<version>-<rust-triple>.{tar.gz,zip}
+
 name: Package
 
 on:
@@ -20,6 +32,14 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: >-
+          After multi-arch build succeeds, create git tag v<Cargo.toml version>
+          and publish a GitHub Release with the dist archives
+        type: boolean
+        default: false
 
 concurrency:
   group: package-${{ github.workflow }}-${{ github.ref }}
@@ -29,63 +49,289 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  package:
-    name: dist · upload artifacts
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    permissions:
-      contents: write
+  resolve-version:
+    name: resolve Cargo.toml version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - id: v
+        name: Read workspace version
+        run: |
+          set -euo pipefail
+          VERSION="$(grep '^version' Cargo.toml | head -1 | sed -n 's/^version *= *"\([^"]*\)".*/\1/p')"
+          if [[ -z "${VERSION}" || ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
+            echo "Could not parse semver from Cargo.toml: '${VERSION}'"
+            exit 1
+          fi
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version=${VERSION} → release tag=${TAG}"
 
+  lint:
+    name: license · fmt · clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            cmake \
-            pkg-config \
-            libssl-dev \
-            libsasl2-dev \
-            libcurl4-openssl-dev \
-            protobuf-compiler \
-            zip
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.94.1
-
-      # Release + cross-target (make dist) compile cache.
-      - name: Cache Rust compile artifacts
-        uses: Swatinem/rust-cache@v2
+            build-essential cmake pkg-config \
+            libssl-dev libsasl2-dev libcurl4-openssl-dev protobuf-compiler
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: monots-cargo-v1
-          shared-key: package-release
-          key: ${{ runner.os }}-gnu
-          cache-targets: "true"
-          cache-all-crates: "true"
-          cache-on-failure: "true"
+          shared-key: package-lint
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/') }}
+      - run: make check-ci
+
+  # Compile + package on every PR/push (independent of lint so we still see
+  # arch build failures when fmt/clippy fails).
+  package-native:
+    name: native (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-gnu
+            os: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+          - name: linux-aarch64-gnu
+            os: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+          - name: darwin-aarch64
+            os: macos-15
+            triple: aarch64-apple-darwin
+          - name: darwin-x86_64
+            os: macos-15-intel
+            triple: x86_64-apple-darwin
+          - name: windows-x86_64
+            os: windows-2022
+            triple: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            libssl-dev libsasl2-dev libcurl4-openssl-dev \
+            protobuf-compiler zip
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake pkg-config protobuf openssl@3 || true
+
+      - name: Install system dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc cmake -y
+        shell: pwsh
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: monots-cargo-v1
+          shared-key: package-native-${{ matrix.name }}
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/') }}
 
-      - name: Build and package release layout
-        run: make dist
+      - name: Build and package (Unix)
+        if: runner.os != 'Windows'
+        run: make dist-host TARGET=${{ matrix.triple }}
 
-      - name: Upload dist archives
-        uses: actions/upload-artifact@v4
+      - name: Build and package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep '^version' Cargo.toml | head -1 | awk -F '"' '{print $2}')"
+          TRIPLE="${{ matrix.triple }}"
+          NAME="monots-${VERSION}-${TRIPLE}"
+          cargo build --release -p server -p cli
+          mkdir -p "dist/${NAME}/bin" "dist/${NAME}/conf" "dist/${NAME}/data" "dist/${NAME}/logs"
+          cp target/release/monots-server.exe "dist/${NAME}/bin/"
+          cp target/release/monots.exe "dist/${NAME}/bin/"
+          cp conf/config.yaml "dist/${NAME}/conf/"
+          cp README.md LICENSE NOTICE "dist/${NAME}/"
+          printf "Name: monots\nVersion: %s\nTriple: %s\nDate: %s\n" \
+            "$VERSION" "$TRIPLE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "dist/${NAME}/manifest.txt"
+          (cd dist && tar -czf "${NAME}.tar.gz" "${NAME}")
+          if command -v zip >/dev/null 2>&1; then
+            (cd dist && zip -rq "${NAME}.zip" "${NAME}")
+          else
+            powershell -NoProfile -Command \
+              "Compress-Archive -Path 'dist/${NAME}' -DestinationPath 'dist/${NAME}.zip' -Force"
+          fi
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: monots-dist-${{ github.sha }}
+          name: monots-dist-${{ matrix.name }}-${{ github.sha }}
           path: |
             dist/*.tar.gz
             dist/*.zip
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish GitHub Release assets
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+  package-embedded:
+    name: embedded (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-armv7-gnueabihf
+            platform: linux/arm/v7
+            triple: armv7-unknown-linux-gnueabihf
+          - name: linux-riscv64-gnu
+            platform: linux/riscv64
+            triple: riscv64gc-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zip
+
+      - name: Package via Buildx (QEMU native compile)
+        run: |
+          chmod +x scripts/package-docker-platform.sh
+          ./scripts/package-docker-platform.sh \
+            "${{ matrix.platform }}" \
+            "${{ matrix.triple }}"
+
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: monots-dist-${{ matrix.name }}-${{ github.sha }}
+          path: |
             dist/*.tar.gz
             dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # Required status for PRs / branch pushes: every arch must have compiled.
+  compile-ok:
+    name: multi-arch compile gate
+    needs: [package-native, package-embedded]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: All package jobs must succeed
+        run: |
+          echo "event=${{ github.event_name }} ref=${{ github.ref }}"
+          echo "package-native=${{ needs.package-native.result }}"
+          echo "package-embedded=${{ needs.package-embedded.result }}"
+          test "${{ needs.package-native.result }}" = "success"
+          test "${{ needs.package-embedded.result }}" = "success"
+          echo "All multi-arch builds completed successfully."
+
+  release:
+    name: GitHub Release (tag + assets)
+    needs: [resolve-version, compile-ok]
+    # Tag push, or manual "Run workflow" with publish_release=true.
+    if: |
+      always()
+      && needs.resolve-version.result == 'success'
+      && needs.compile-ok.result == 'success'
+      && (
+        startsWith(github.ref, 'refs/tags/')
+        || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+      )
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          expect="${{ needs.resolve-version.outputs.tag }}"
+          actual="${{ github.ref_name }}"
+          if [[ "${actual}" != "${expect}" ]]; then
+            echo "Pushed tag '${actual}' does not match Cargo.toml (${expect})."
+            echo "Bump [workspace.package] version in Cargo.toml, or retag."
+            exit 1
+          fi
+          echo "Tag ${actual} matches Cargo.toml."
+
+      - name: Refuse reusing an existing tag on a different commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse "${{ github.sha }}")"
+          if git fetch --tags --force origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null; then
+            existing="$(git rev-list -n 1 "${TAG}" 2>/dev/null || true)"
+            if [[ -n "${existing}" && "${existing}" != "${sha}" ]]; then
+              echo "Tag ${TAG} already points to ${existing}, not ${sha}."
+              echo "Bump Cargo.toml version before publishing again."
+              exit 1
+            fi
+          fi
+          echo "Will publish Release / tag ${TAG} at ${sha}"
+
+      - name: Download all dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: monots-dist-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify package names include version
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "Expecting archives named monots-${VERSION}-<triple>.*"
+          find release-assets -type f | sort
+          mapfile -t files < <(find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' \))
+          test "${#files[@]}" -gt 0
+          for f in "${files[@]}"; do
+            base="$(basename "$f")"
+            case "$base" in
+              monots-"${VERSION}"-*) ;;
+              *)
+                echo "Archive name missing version ${VERSION}: ${base}"
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Create tag v<version> and publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Creates the tag on the current SHA when missing (workflow_dispatch path).
+          tag_name: ${{ needs.resolve-version.outputs.tag }}
+          name: MonoTS ${{ needs.resolve-version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          files: release-assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ contains(needs.resolve-version.outputs.version, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -24,7 +24,8 @@ DOCKER_PORT  ?= 50051
 VERSION      := $(shell grep '^version' Cargo.toml | head -1 | awk -F '"' '{print $$2}')
 DATE         := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# Auto-detect system environment & normalize architecture
+# Auto-detect system environment & normalize architecture.
+# Override with: make dist TARGET=aarch64-unknown-linux-gnu
 RAW_ARCH := $(shell uname -m)
 ifeq ($(RAW_ARCH), arm64)
     ARCH := aarch64
@@ -39,25 +40,32 @@ OS_NAME     := $(shell uname -s)
 
 DIST_ROOT   := dist
 ifeq ($(OS_NAME), Linux)
-    TRIPLE := $(ARCH)-unknown-linux-gnu
+    HOST_TRIPLE := $(ARCH)-unknown-linux-gnu
     STATIC_FLAGS :=
 else ifeq ($(OS_NAME), Darwin)
-    TRIPLE := $(ARCH)-apple-darwin
+    HOST_TRIPLE := $(ARCH)-apple-darwin
     STATIC_FLAGS :=
-else ifneq (,$(findstring MINGW,$(OS_NAME))$(findstring MSYS,$(OS_NAME)))
-    TRIPLE := $(ARCH)-pc-windows-msvc
+else ifneq (,$(findstring MINGW,$(OS_NAME))$(findstring MSYS,$(OS_NAME))$(findstring CYGWIN,$(OS_NAME)))
+    HOST_TRIPLE := $(ARCH)-pc-windows-msvc
     STATIC_FLAGS := -C target-feature=+crt-static
 else
-    TRIPLE := $(ARCH)-unknown-linux-gnu
+    HOST_TRIPLE := $(ARCH)-unknown-linux-gnu
     STATIC_FLAGS :=
 endif
+
+# Explicit TARGET wins (CI / cross / docker-exported host builds).
+TRIPLE ?= $(HOST_TRIPLE)
+# Derive short arch label from triple (first component).
+ARCH_FROM_TRIPLE := $(shell echo "$(TRIPLE)" | cut -d- -f1)
+ARCH := $(ARCH_FROM_TRIPLE)
 
 OPTIMIZE_FLAGS := -C opt-level=z -C strip=symbols $(STATIC_FLAGS)
 
 TARGET_DIR  := target/$(TRIPLE)/release
 HOST_BIN_DIR := target/release
 
-FULL_NAME   := $(APP_NAME)-$(VERSION)
+# Release archives are named by Rust target triple for unambiguous FOSS packages.
+FULL_NAME   := $(APP_NAME)-$(VERSION)-$(TRIPLE)
 FULL_PATH   := $(DIST_ROOT)/$(FULL_NAME)
 
 C_R := \033[0;31m
@@ -69,40 +77,20 @@ C_0 := \033[0m
 log = @printf "$(C_B)[-]$(C_0) %-15s %s\n" "$(1)" "$(2)"
 success = @printf "$(C_G)[✔]$(C_0) %s\n" "$(1)"
 
-.PHONY: all help build build-host dev test integration-test clean dist run-server run-cli \
-	docker-build docker-run docker-up docker-down fmt fmt-check check check-license \
-	.check-env .ensure-target
+.PHONY: all help build build-host dev test integration-test clean dist dist-host run-server run-cli \
+	docker-build docker-run docker-up docker-down fmt fmt-check clippy check check-ci check-license \
+	package-docker .check-env .ensure-target
 
 all: build-host
 
 help:
-	@echo "Usage: make [TARGET]"
+	@echo "Usage: make [target]"
 	@echo ""
-	@echo "  build       Build release binaries (cross-target: $(TRIPLE))"
-	@echo "  build-host  Build release binaries for current host (faster local dev)"
-	@echo "  dev         Debug build (current host)"
-	@echo "  test                Run workspace unit tests (excludes integration)"
-	@echo "  integration-test    Run Rust integration tests (tests/integration)"
-	@echo "  dist        Package release layout to dist/$(FULL_NAME).{tar.gz,zip}"
-	@echo "  check       License header check + cargo check"
-	@echo "  check-license  Verify Apache-2.0 copyright headers on source files"
-	@echo "  fmt         cargo fmt"
-	@echo "  fmt-check   cargo fmt --check (CI)"
-	@echo "  run-server  Start server via scripts/start-server.sh (host build)"
-	@echo "  run-cli     Start interactive CLI"
-	@echo "  docker-build  Build Docker image ($(DOCKER_IMAGE))"
-	@echo "  docker-run    Run container (port $(DOCKER_PORT), named volume for data)"
-	@echo "  docker-up     docker compose up -d --build"
-	@echo "  docker-down   docker compose down"
-	@echo "  clean       Remove build artifacts, dist, data, logs"
+	@echo "  build / build-host / dist / dist-host"
+	@echo "  package-docker PLATFORM=linux/arm/v7 TRIPLE=armv7-unknown-linux-gnueabihf"
+	@echo "  check-ci   license + fmt-check + clippy"
+	@echo "  Version $(VERSION) | host $(HOST_TRIPLE) | package $(TRIPLE)"
 	@echo ""
-	@echo "  Version: $(VERSION) | Arch: $(ARCH) | OS: $(OS)"
-	@echo ""
-	@echo "Project layout (FunctionStream robot-branch style):"
-	@echo "  src/{common,catalog,storage,query,core,server}/  — Rust crates"
-	@echo "  sdk/  — gRPC client SDK"
-	@echo "  proto/ cli/cli/ tests/integration/ benchmark/        — workspace members"
-	@echo "  conf/ scripts/ dist/ data/ logs/"
 
 .check-env:
 	@command -v cargo >/dev/null 2>&1 || { printf "$(C_R)[X] Cargo not found$(C_0)\n"; exit 1; }
@@ -147,6 +135,15 @@ check: .check-env check-license
 	$(call log,CHECK,cargo check)
 	@cargo check --workspace --quiet
 
+clippy: .check-env
+	$(call log,CLIPPY,cargo clippy \(correctness + suspicious + dead_code\))
+	@cargo clippy --workspace --all-targets \
+		--exclude monots-integration-tests \
+		-- -D clippy::correctness -D clippy::suspicious -D dead_code
+
+check-ci: check-license fmt-check clippy
+	$(call success,CI checks passed \(license + fmt + clippy\))
+
 fmt:
 	$(call log,FMT,cargo fmt)
 	@cargo fmt --all
@@ -165,7 +162,7 @@ dist: build
 	@chmod +x "$(FULL_PATH)/bin/"*.sh
 	@cp conf/config.yaml "$(FULL_PATH)/conf/config.yaml"
 	@cp README.md LICENSE NOTICE "$(FULL_PATH)/"
-	@printf "Name: $(APP_NAME)\nVersion: $(VERSION)\nBuild: $(ARCH)-$(OS)\nTriple: $(TRIPLE)\nDate: $(DATE)\n" > "$(FULL_PATH)/manifest.txt"
+	@printf "Name: $(APP_NAME)\nVersion: $(VERSION)\nTriple: $(TRIPLE)\nDate: $(DATE)\n" > "$(FULL_PATH)/manifest.txt"
 	$(call log,ARCHIVE,Compressing...)
 	@cd $(DIST_ROOT) && tar -czf "$(FULL_NAME).tar.gz" "$(FULL_NAME)"
 	@cd $(DIST_ROOT) && zip -rq "$(FULL_NAME).zip" "$(FULL_NAME)"
@@ -181,10 +178,19 @@ dist-host: build-host
 	@chmod +x "$(FULL_PATH)/bin/"*.sh
 	@cp conf/config.yaml "$(FULL_PATH)/conf/config.yaml"
 	@cp README.md LICENSE NOTICE "$(FULL_PATH)/"
-	@printf "Name: $(APP_NAME)\nVersion: $(VERSION)\nBuild: $(ARCH)-$(OS)\nDate: $(DATE)\n" > "$(FULL_PATH)/manifest.txt"
+	@printf "Name: $(APP_NAME)\nVersion: $(VERSION)\nTriple: $(TRIPLE)\nHost: $(HOST_TRIPLE)\nDate: $(DATE)\n" > "$(FULL_PATH)/manifest.txt"
 	@cd $(DIST_ROOT) && tar -czf "$(FULL_NAME).tar.gz" "$(FULL_NAME)"
 	@cd $(DIST_ROOT) && zip -rq "$(FULL_NAME).zip" "$(FULL_NAME)"
 	$(call success,Ready: $(DIST_ROOT)/$(FULL_NAME).tar.gz)
+
+# Embedded / foreign Linux arches via Buildx+QEMU (see scripts/package-docker-platform.sh).
+# Example: make package-docker PLATFORM=linux/arm/v7 TRIPLE=armv7-unknown-linux-gnueabihf
+package-docker:
+	@test -n "$(PLATFORM)" || { printf "$(C_R)[X] PLATFORM= required$(C_0)\n"; exit 1; }
+	@test -n "$(TRIPLE)" || { printf "$(C_R)[X] TRIPLE= required$(C_0)\n"; exit 1; }
+	$(call log,DOCKER,package $(PLATFORM) / $(TRIPLE))
+	@chmod +x scripts/package-docker-platform.sh
+	@./scripts/package-docker-platform.sh "$(PLATFORM)" "$(TRIPLE)"
 
 run-server: build-host
 	$(call log,RUN,start-server.sh)

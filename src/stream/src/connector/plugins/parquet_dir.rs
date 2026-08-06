@@ -16,7 +16,7 @@
 //!
 //! Transactional write path:
 //! - `write` copies into `*.parquet.tmp`
-//! - `commit_txn` atomically renames to `*.parquet`
+//! - `commit_txn_with_paths` atomically renames to `*.parquet`
 //! - `abort_txn` unlinks tracked `.tmp` files
 
 use std::ffi::OsString;
@@ -156,10 +156,6 @@ impl ParquetDirStaging {
         Ok(committed)
     }
 
-    pub async fn commit_txn(&mut self) -> Result<(), SinkError> {
-        self.commit_txn_with_paths().await.map(|_| ())
-    }
-
     pub async fn abort_txn(&mut self) -> Result<(), SinkError> {
         if !self.in_transaction {
             return Ok(());
@@ -240,7 +236,8 @@ mod tests {
 
         let tmp = dest.join("src-000.parquet.tmp");
         assert!(tmp.is_file());
-        staging.commit_txn().await.unwrap();
+        let committed = staging.commit_txn_with_paths().await.unwrap();
+        assert_eq!(committed.len(), 1);
         assert!(!tmp.exists());
         assert!(dest.join("src-000.parquet").is_file());
     }

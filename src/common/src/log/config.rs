@@ -19,42 +19,33 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Log output format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     /// Human-readable lines for development / foreground servers.
+    #[default]
     Pretty,
     /// JSON lines for production log aggregation (ELK, Loki, etc.).
     Json,
 }
 
-impl Default for LogFormat {
-    fn default() -> Self {
-        Self::Pretty
-    }
-}
-
 /// File rotation policy for on-disk logs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogRotation {
     Hourly,
+    #[default]
     Daily,
     Never,
 }
 
-impl Default for LogRotation {
-    fn default() -> Self {
-        Self::Daily
-    }
-}
-
 /// Per-module log level (`error` | `warn` | `info` | `debug` | `trace`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Error,
     Warn,
+    #[default]
     Info,
     Debug,
     Trace,
@@ -69,12 +60,6 @@ impl LogLevel {
             Self::Debug => "debug",
             Self::Trace => "trace",
         }
-    }
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        Self::Info
     }
 }
 

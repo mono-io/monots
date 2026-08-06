@@ -33,6 +33,8 @@ SKIP_PREFIXES=(
   './.venv/'
   './data/'
   './logs/'
+  # Vendored third-party crates (retain upstream Apache headers).
+  './patches/'
 )
 
 should_skip() {

@@ -19,6 +19,7 @@ use common::{ConnectorType, Result, StreamCaptureMode, TsdbError};
 use super::delta_options::{DeltaSinkOptions, DELTA_OPTION_KEYS, FILESYSTEM_OPTION_KEYS};
 use super::iceberg_options::{IcebergSinkOptions, ICEBERG_OPTION_KEYS};
 use super::kafka_options::{KafkaSinkOptions, KAFKA_OPTION_KEYS};
+use super::pulsar_options::{PulsarSinkOptions, PULSAR_OPTION_KEYS};
 
 /// Pure stream configuration (persisted in `streams/*.pb`).
 #[derive(Debug, Clone)]
@@ -32,7 +33,7 @@ pub struct StreamDef {
     pub auto_end: bool,
 }
 
-/// Strongly-typed downstream sink config (Delta / Kafka / Filesystem / Iceberg).
+/// Strongly-typed downstream sink config (Delta / Kafka / Filesystem / Iceberg / Pulsar).
 #[derive(Debug, Clone)]
 pub enum SinkConfig {
     Kafka {
@@ -56,6 +57,11 @@ pub enum SinkConfig {
     },
     /// Apache Iceberg table via Catalog (`sink.iceberg.*`).
     Iceberg { options: IcebergSinkOptions },
+    /// Apache Pulsar topic (`sink.pulsar.*`).
+    Pulsar {
+        format: String,
+        options: PulsarSinkOptions,
+    },
 }
 
 impl SinkConfig {
@@ -65,12 +71,13 @@ impl SinkConfig {
             Self::Delta { .. } => ConnectorType::Delta,
             Self::Filesystem { .. } => ConnectorType::Filesystem,
             Self::Iceberg { .. } => ConnectorType::Iceberg,
+            Self::Pulsar { .. } => ConnectorType::Pulsar,
         }
     }
 
     pub fn delivery_format(&self) -> &str {
         match self {
-            Self::Kafka { format, .. } => format.as_str(),
+            Self::Kafka { format, .. } | Self::Pulsar { format, .. } => format.as_str(),
             Self::Delta { .. } | Self::Filesystem { .. } | Self::Iceberg { .. } => "parquet",
         }
     }
@@ -79,7 +86,7 @@ impl SinkConfig {
         match self {
             Self::Delta { path, .. } | Self::Filesystem { path, .. } => Some(path.as_str()),
             Self::Iceberg { options } => options.warehouse.as_deref(),
-            Self::Kafka { .. } => None,
+            Self::Kafka { .. } | Self::Pulsar { .. } => None,
         }
     }
 
@@ -128,6 +135,13 @@ impl SinkConfig {
     pub fn iceberg_options(&self) -> Option<&IcebergSinkOptions> {
         match self {
             Self::Iceberg { options } => Some(options),
+            _ => None,
+        }
+    }
+
+    pub fn pulsar_options(&self) -> Option<&PulsarSinkOptions> {
+        match self {
+            Self::Pulsar { options, .. } => Some(options),
             _ => None,
         }
     }
@@ -255,7 +269,7 @@ fn reject_legacy_keys(options: &HashMap<String, String>) -> Result<()> {
         return Ok(());
     }
     Err(TsdbError::Query(format!(
-        "unsupported options {} (use sink.delta.|sink.filesystem.|sink.kafka.|sink.iceberg. prefixed keys)",
+        "unsupported options {} (use sink.delta.|sink.filesystem.|sink.kafka.|sink.iceberg.|sink.pulsar. prefixed keys)",
         present.join(", ")
     )))
 }
@@ -279,6 +293,11 @@ fn reject_foreign_sink_keys(
         "sink.iceberg.create-table-if-not-exists",
         "sink.iceberg.endpoint",
     ];
+    let pulsar_keys = [
+        "sink.pulsar.topic",
+        "sink.pulsar.service-url",
+        "sink.pulsar.admin-url",
+    ];
 
     let mut bad: Vec<&str> = Vec::new();
     let mut push_if = |keys: &[&'static str]| {
@@ -295,6 +314,8 @@ fn reject_foreign_sink_keys(
             push_if(KAFKA_OPTION_KEYS);
             push_if(&iceberg_core);
             push_if(ICEBERG_OPTION_KEYS);
+            push_if(&pulsar_keys);
+            push_if(PULSAR_OPTION_KEYS);
         }
         ConnectorType::Filesystem => {
             push_if(&delta_keys);
@@ -303,6 +324,8 @@ fn reject_foreign_sink_keys(
             push_if(KAFKA_OPTION_KEYS);
             push_if(&iceberg_core);
             push_if(ICEBERG_OPTION_KEYS);
+            push_if(&pulsar_keys);
+            push_if(PULSAR_OPTION_KEYS);
         }
         ConnectorType::Kafka => {
             push_if(&delta_keys);
@@ -311,6 +334,8 @@ fn reject_foreign_sink_keys(
             push_if(FILESYSTEM_OPTION_KEYS);
             push_if(&iceberg_core);
             push_if(ICEBERG_OPTION_KEYS);
+            push_if(&pulsar_keys);
+            push_if(PULSAR_OPTION_KEYS);
         }
         ConnectorType::Iceberg => {
             push_if(&delta_keys);
@@ -319,6 +344,18 @@ fn reject_foreign_sink_keys(
             push_if(FILESYSTEM_OPTION_KEYS);
             push_if(&kafka_keys);
             push_if(KAFKA_OPTION_KEYS);
+            push_if(&pulsar_keys);
+            push_if(PULSAR_OPTION_KEYS);
+        }
+        ConnectorType::Pulsar => {
+            push_if(&delta_keys);
+            push_if(DELTA_OPTION_KEYS);
+            push_if(&fs_keys);
+            push_if(FILESYSTEM_OPTION_KEYS);
+            push_if(&kafka_keys);
+            push_if(KAFKA_OPTION_KEYS);
+            push_if(&iceberg_core);
+            push_if(ICEBERG_OPTION_KEYS);
         }
     }
 
@@ -428,6 +465,10 @@ pub fn parse_stream_def(
         }
         ConnectorType::Iceberg => SinkConfig::Iceberg {
             options: IcebergSinkOptions::from_ddl(options)?,
+        },
+        ConnectorType::Pulsar => SinkConfig::Pulsar {
+            format: delivery_format,
+            options: PulsarSinkOptions::from_ddl(options)?,
         },
     };
 

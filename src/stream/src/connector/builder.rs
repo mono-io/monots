@@ -23,7 +23,10 @@ use crate::model::StreamDef;
 
 use super::api::SinkConnector;
 use super::config::ResolvedSinkConfig;
-use super::plugins::{DeltaSink, FilesystemSink, IcebergSink, KafkaSink, PayloadFormat};
+use super::plugins::{
+    DeltaSink, FilesystemSink, IcebergSink, KafkaSink, PayloadFormat, PulsarSink,
+};
+use super::plugins::pulsar::PayloadFormat as PulsarPayloadFormat;
 
 /// Build the physical sink for a stream definition.
 pub fn build_sink(def: &StreamDef) -> Result<Box<dyn SinkConnector>> {
@@ -83,6 +86,19 @@ pub fn build_sink_with_engine(
         ResolvedSinkConfig::Iceberg { options } => Ok(Box::new(
             IcebergSink::new(options).map_err(|e| common::TsdbError::Query(e.to_string()))?,
         )),
+        ResolvedSinkConfig::Pulsar { format, options } => {
+            let format = PulsarPayloadFormat::from_str_name(&format)
+                .map_err(|e| common::TsdbError::Query(e.to_string()))?;
+            let mut sink = PulsarSink::new(format, options);
+            if let Some(engine) = engine {
+                if let Ok(loader) =
+                    StreamArrowLoader::from_engine(engine, def.source_tables[0].as_str())
+                {
+                    sink = sink.with_arrow_loader(loader);
+                }
+            }
+            Ok(Box::new(sink))
+        }
     }
 }
 
@@ -146,6 +162,29 @@ mod tests {
             ..kafka.clone()
         };
         let _ = build_sink(&iceberg).unwrap();
+
+        let mut pulsar_opts = std::collections::HashMap::new();
+        pulsar_opts.insert(
+            "sink.pulsar.topic".into(),
+            "persistent://public/default/t".into(),
+        );
+        pulsar_opts.insert(
+            "sink.pulsar.service-url".into(),
+            "pulsar://localhost:6650".into(),
+        );
+        pulsar_opts.insert(
+            "sink.pulsar.admin-url".into(),
+            "http://localhost:8080".into(),
+        );
+        let pulsar = StreamDef {
+            sink_config: SinkConfig::Pulsar {
+                format: "json".into(),
+                options: crate::model::PulsarSinkOptions::from_ddl(&pulsar_opts).unwrap(),
+            },
+            capture_mode: common::StreamCaptureMode::Hybrid,
+            ..kafka.clone()
+        };
+        let _ = build_sink(&pulsar).unwrap();
 
         let _ = NoopSink::default();
         let _ = ConnectorType::Kafka;

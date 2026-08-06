@@ -1,6 +1,6 @@
 # MonoTS Streams (CDC) Reference
 
-MonoTS Change Data Capture (CDC) Streams allow you to continuously push table changes to downstream systems like Delta Lake, Kafka, or local filesystems.
+MonoTS Change Data Capture (CDC) Streams allow you to continuously push table changes to downstream systems like Delta Lake, Kafka, Pulsar, Iceberg, or local filesystems.
 
 Delivery is **server-driven** (push model) with **at-least-once** guarantees. There is no client-side pull API.
 
@@ -42,7 +42,7 @@ Every stream requires a `WITH` clause to define its sink and capture behavior.
 
 | Property       | Required | Description                                                                                                                               |
 |----------------|----------|-------------------------------------------------------------------------------------------------------------------------------------------|
-| `sink.type`    | Yes      | Destination type: `filesystem`, `delta`, `kafka`, or `iceberg`.                                                                              |
+| `sink.type`    | Yes      | Destination type: `filesystem`, `delta`, `kafka`, `iceberg`, or `pulsar`.                                                                    |
 | `source.table` | Yes      | The name of the table to capture.                                                                                                         |
 | `cdc.mode`     | No       | `batch` (historical Parquet files only) or `hybrid` (historical files + live WAL tailing). Defaults depend on the sink.                   |
 | `cdc.auto_end` | No       | `true` or `false` (default). If `true`, the stream automatically terminates after the current historical export finishes (one-shot mode). |
@@ -234,6 +234,60 @@ CREATE STREAM metrics_iceberg_s3 WITH (
   'sink.iceberg.secret.key' = 'minioadmin',
   'sink.iceberg.namespace' = 'db',
   'sink.iceberg.table' = 'metrics',
+  'source.table' = 'metrics'
+);
+```
+
+```sql
+CREATE STREAM metrics_iceberg_rest WITH (
+  'sink.type' = 'iceberg',
+  'sink.iceberg.catalog-type' = 'rest',
+  'sink.iceberg.catalog-name' = 'rest',
+  'sink.iceberg.uri' = 'http://127.0.0.1:18181',
+  'sink.iceberg.warehouse' = 's3://monots/iceberg-rest-warehouse/',
+  'sink.iceberg.namespace' = 'db',
+  'sink.iceberg.table' = 'metrics',
+  'sink.iceberg.endpoint' = 'http://127.0.0.1:19000',
+  'sink.iceberg.access.key' = 'minioadmin',
+  'sink.iceberg.secret.key' = 'minioadmin',
+  'source.table' = 'metrics'
+);
+```
+
+---
+
+## Sink: Pulsar (`sink.type = 'pulsar'`)
+
+Pushes change events as row-level JSON messages to an Apache Pulsar topic (pure-Rust `pulsar` client). Options mirror the Flink Pulsar connector under the `sink.pulsar.*` prefix.
+
+- **Default `cdc.mode`:** `hybrid`
+- **Default `sink.format`:** `json`
+- **Default delivery:** `at-least-once` (await broker send receipt). `none` enqueues without waiting. `exactly-once` is rejected for now — the Rust client has no Transaction API (Flink EOS needs `transactionCoordinatorEnabled=true` on the broker).
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `sink.pulsar.topic` | *(required)* | Full topic name, e.g. `persistent://public/default/my-topic`. |
+| `sink.pulsar.service-url` | *(required)* | Broker URL (`pulsar://host:6650` or `pulsar+ssl://…`). |
+| `sink.pulsar.admin-url` | *(required)* | Admin HTTP API (`http://host:8080`); used for health/metadata probes. |
+| `sink.pulsar.delivery-guarantee` | `at-least-once` | `none` \| `at-least-once` \| `exactly-once` (EOS not available yet). |
+| `sink.pulsar.transaction-timeout` | — | Flink-style duration (`3 h`, `15m`) or milliseconds; stored for EOS when available. |
+| `sink.pulsar.message-router` | `round-robin` | `round-robin` \| `single` \| `key-hash` (requires `key.fields`). Java `custom` routers are not supported. |
+| `sink.pulsar.key.format` | — | Key serialization; only `json` when keys are enabled. |
+| `sink.pulsar.key.fields` | — | Comma-separated columns used as the Pulsar partition key. |
+| `sink.pulsar.key.fields-prefix` | `""` | Prefix applied to key JSON field names. |
+| `sink.pulsar.auth-plugin` | — | e.g. `org.apache.pulsar.client.impl.auth.AuthenticationToken`. |
+| `sink.pulsar.auth-params` | — | Token auth params (`token:<jwt>` or raw token / `{"token":"…"}`). |
+
+```sql
+CREATE STREAM metrics_pulsar WITH (
+  'sink.type' = 'pulsar',
+  'sink.pulsar.topic' = 'persistent://public/default/metrics-cdc',
+  'sink.pulsar.service-url' = 'pulsar://127.0.0.1:6650',
+  'sink.pulsar.admin-url' = 'http://127.0.0.1:8080',
+  'sink.pulsar.delivery-guarantee' = 'at-least-once',
+  'sink.pulsar.message-router' = 'key-hash',
+  'sink.pulsar.key.format' = 'json',
+  'sink.pulsar.key.fields' = 'order_id',
   'source.table' = 'metrics'
 );
 ```

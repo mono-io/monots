@@ -47,20 +47,21 @@ help:
 	@echo "  test-load          Run tests/load/* binaries"
 	@echo "  test-ddl           Run tests/ddl/* binaries"
 	@echo "  test-recovery      Run tests/recovery/* binaries"
-	@echo "  docker-up          Start Kafka (19092) + MinIO (19000) + Iceberg REST (18181)"
+	@echo "  docker-up          Start Kafka (19092) + MinIO (19000) + Iceberg REST (18181) + Pulsar (16650/18080)"
 	@echo "  docker-down        Tear down compose project monots-it"
-	@echo "  test-stream-docker docker-up + stream_* sink tests (incl. iceberg)"
+	@echo "  test-stream-docker docker-up + stream_* sink tests (incl. iceberg/pulsar)"
 	@echo "  clean              Remove target/ test artifacts"
 	@echo ""
 	@echo "Categories under tests/: auth ddl write query load stream recovery"
 	@echo "Example: make test CARGO_TEST_ARGS=\"--test write_dedup\""
 
 docker-up:
-	$(call log,DOCKER,compose up kafka+minio+iceberg-rest)
+	$(call log,DOCKER,compose up kafka+minio+iceberg-rest+pulsar)
 	@docker compose -f $(CURDIR)/docker-compose.yml -p monots-it up -d kafka minio
 	@docker compose -f $(CURDIR)/docker-compose.yml -p monots-it up -d minio-init || true
 	@docker compose -f $(CURDIR)/docker-compose.yml -p monots-it up -d iceberg-rest || true
-	$(call success,Kafka :19092  MinIO :19000  Iceberg REST :18181 \(wait for ports in tests\))
+	@docker compose -f $(CURDIR)/docker-compose.yml -p monots-it up -d pulsar || true
+	$(call success,Kafka :19092  MinIO :19000  Iceberg REST :18181  Pulsar :16650/:18080 \(wait for ports in tests\))
 
 docker-down:
 	$(call log,DOCKER,compose down)
@@ -107,6 +108,7 @@ test-stream-docker: docker-up
 		--test stream_delta_sink \
 		--test stream_kafka_sink \
 		--test stream_iceberg_sink \
+		--test stream_pulsar_sink \
 		$(CARGO_TEST_ARGS)
 	$(call success,Stream Docker ITs passed)
 clean:

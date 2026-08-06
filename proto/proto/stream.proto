@@ -35,7 +35,8 @@ enum ConnectorType {
   CONNECTOR_TYPE_FILESYSTEM = 6;
   // New Iceberg connector (id 3 was retired; do not reuse).
   CONNECTOR_TYPE_ICEBERG_V1 = 7;
-  // Next id: 8
+  CONNECTOR_TYPE_PULSAR = 8;
+  // Next id: 9
 }
 
 enum StreamCaptureMode {

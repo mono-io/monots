@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Docker Compose helpers for Kafka / MinIO / Iceberg REST integration tests.
+//! Docker Compose helpers for Kafka / MinIO / Iceberg REST / Pulsar integration tests.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,6 +33,10 @@ pub const MINIO_BUCKET: &str = "monots";
 pub const ICEBERG_REST_URI: &str = "http://127.0.0.1:18181";
 /// Warehouse prefix used by the REST fixture (inside [`MINIO_BUCKET`]).
 pub const ICEBERG_REST_WAREHOUSE_PREFIX: &str = "iceberg-rest-warehouse";
+/// Pulsar broker URL on the host (`pulsar` service).
+pub const PULSAR_SERVICE_URL: &str = "pulsar://127.0.0.1:16650";
+/// Pulsar Admin HTTP API on the host.
+pub const PULSAR_ADMIN_URL: &str = "http://127.0.0.1:18080";
 
 static COMPOSE_FILE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -232,4 +236,55 @@ pub async fn require_docker_stack() -> Result<(), String> {
 /// Fail hard unless Iceberg REST Catalog fixture is up (implies MinIO).
 pub async fn require_iceberg_rest() -> Result<(), String> {
     ensure_iceberg_stack_up().await
+}
+
+/// Bring up Pulsar standalone and wait until broker + admin accept connections.
+pub async fn ensure_pulsar_up() -> Result<(), String> {
+    compose_run(&["up", "-d", "pulsar"])?;
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let broker_ok = wait_for_port(
+            "127.0.0.1:16650",
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+        )
+        .await;
+        let admin_ok = wait_for_port(
+            "127.0.0.1:18080",
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+        )
+        .await;
+        if broker_ok && admin_ok {
+            let url = format!("{PULSAR_ADMIN_URL}/admin/v2/brokers/health");
+            match reqwest::get(&url).await {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) => {
+                    if Instant::now() > deadline {
+                        return Err(format!(
+                            "Pulsar admin health returned HTTP {}",
+                            resp.status()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    if Instant::now() > deadline {
+                        return Err(format!("GET {url} failed: {e}"));
+                    }
+                }
+            }
+        }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "Pulsar not ready within 180s (broker={broker_ok} admin={admin_ok})"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Fail hard unless Pulsar standalone is up.
+pub async fn require_pulsar() -> Result<(), String> {
+    ensure_pulsar_up().await
 }

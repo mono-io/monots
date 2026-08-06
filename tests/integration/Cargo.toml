@@ -21,6 +21,8 @@ arrow = { workspace = true }
 parquet = { workspace = true }
 libc = "0.2"
 rdkafka = { version = "0.37", features = ["cmake-build", "tokio", "curl"] }
+pulsar = { version = "6.8", default-features = false, features = ["tokio-runtime", "compression"] }
+futures = "0.3"
 object_store = { version = "0.11", features = ["aws"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
@@ -158,6 +160,10 @@ path = "tests/stream/kafka_sink.rs"
 [[test]]
 name = "stream_iceberg_sink"
 path = "tests/stream/iceberg_sink.rs"
+
+[[test]]
+name = "stream_pulsar_sink"
+path = "tests/stream/pulsar_sink.rs"
 
 [[test]]
 name = "stream_sql_ddl"

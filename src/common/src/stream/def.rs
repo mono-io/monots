@@ -89,6 +89,8 @@ pub enum ConnectorType {
     Filesystem,
     /// Apache Iceberg table via Catalog (`sink.iceberg.*`).
     Iceberg,
+    /// Apache Pulsar topic (`sink.pulsar.*`).
+    Pulsar,
 }
 
 impl ConnectorType {
@@ -98,8 +100,9 @@ impl ConnectorType {
             "kafka" => Ok(Self::Kafka),
             "filesystem" | "fs" | "file" => Ok(Self::Filesystem),
             "iceberg" => Ok(Self::Iceberg),
+            "pulsar" => Ok(Self::Pulsar),
             other => Err(TsdbError::Query(format!(
-                "unsupported sink.type: {other} (supported: delta | kafka | filesystem | iceberg)"
+                "unsupported sink.type: {other} (supported: delta | kafka | filesystem | iceberg | pulsar)"
             ))),
         }
     }
@@ -110,6 +113,7 @@ impl ConnectorType {
             Self::Kafka => "kafka",
             Self::Filesystem => "filesystem",
             Self::Iceberg => "iceberg",
+            Self::Pulsar => "pulsar",
         }
     }
 }

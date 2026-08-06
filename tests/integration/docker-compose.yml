@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kafka (KRaft) + MinIO + Iceberg REST fixture for stream sink integration tests.
+# Kafka (KRaft) + MinIO + Iceberg REST + Pulsar for stream sink integration tests.
 # Host ports are high to avoid clashing with a local broker on :9092.
 #
 #   make -C tests/integration docker-up
@@ -110,3 +110,15 @@ services:
       timeout: 5s
       retries: 24
       start_period: 15s
+
+  # Apache Pulsar standalone (broker :6650, admin :8080).
+  pulsar:
+    image: apachepulsar/pulsar:3.3.2
+    container_name: monots-it-pulsar
+    command: bin/pulsar standalone
+    ports:
+      - "16650:6650"
+      - "18080:8080"
+    environment:
+      PULSAR_MEM: "-Xms512m -Xmx512m"
+    # Port readiness is verified by the Rust IT harness.

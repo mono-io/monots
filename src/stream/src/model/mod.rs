@@ -20,6 +20,7 @@ pub mod event;
 pub mod iceberg_options;
 pub mod kafka_options;
 pub mod metrics;
+pub mod pulsar_options;
 pub mod source_spec;
 pub mod state;
 
@@ -35,6 +36,10 @@ pub use iceberg_options::{
 };
 pub use kafka_options::{
     KafkaDeliveryGuarantee, KafkaPartitioner, KafkaSinkOptions, KAFKA_OPTION_KEYS,
+};
+pub use pulsar_options::{
+    PulsarDeliveryGuarantee, PulsarMessageRouter, PulsarSinkOptions, PULSAR_OPTION_KEYS,
+    PULSAR_OPTION_PREFIX,
 };
 pub use metrics::{
     ExecutionStep, MetricsRegistry, RuntimeStateRegistry, StreamMetrics, StreamRuntimeState,

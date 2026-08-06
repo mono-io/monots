@@ -51,3 +51,7 @@ arc-swap = "1.7"
 libc = "0.2"
 crc32fast = "1.4"
 lru = "0.12"
+
+# arrow-arith 53.4.0 + chrono >=0.4.40: disambiguate Datelike::quarter (see patches/).
+[patch.crates-io]
+arrow-arith = { path = "patches/arrow-arith-53.4.0" }

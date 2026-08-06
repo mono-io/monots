@@ -47,6 +47,10 @@ pub enum ResolvedSinkConfig {
     Iceberg {
         options: crate::model::IcebergSinkOptions,
     },
+    Pulsar {
+        format: String,
+        options: crate::model::PulsarSinkOptions,
+    },
 }
 
 impl ResolvedSinkConfig {
@@ -119,16 +123,38 @@ impl ResolvedSinkConfig {
                 };
                 Ok(Self::Iceberg { options })
             }
+            ConnectorType::Pulsar => {
+                let (format, options) = match &def.sink_config {
+                    crate::model::SinkConfig::Pulsar { format, options } => {
+                        (format.clone(), options.clone())
+                    }
+                    _ => {
+                        return Err(TsdbError::Query(
+                            "pulsar sink requires sink.pulsar.* options".into(),
+                        ))
+                    }
+                };
+                if options.topic.is_empty()
+                    || options.service_url.is_empty()
+                    || options.admin_url.is_empty()
+                {
+                    return Err(TsdbError::Query(
+                        "Pulsar requires sink.pulsar.topic, sink.pulsar.service-url, and sink.pulsar.admin-url"
+                            .into(),
+                    ));
+                }
+                Ok(Self::Pulsar { format, options })
+            }
         }
     }
 }
 
 /// Default capture mode when `cdc.mode` is omitted.
 ///
-/// Kafka defaults to hybrid (batch backfill + WAL tail); filesystem / delta / iceberg default to batch.
+/// Kafka / Pulsar default to hybrid (batch backfill + WAL tail); filesystem / delta / iceberg default to batch.
 pub fn connector_capture_mode(connector: ConnectorType) -> StreamCaptureMode {
     match connector {
-        ConnectorType::Kafka => StreamCaptureMode::Hybrid,
+        ConnectorType::Kafka | ConnectorType::Pulsar => StreamCaptureMode::Hybrid,
         ConnectorType::Delta | ConnectorType::Filesystem | ConnectorType::Iceberg => {
             StreamCaptureMode::Batch
         }
@@ -137,14 +163,14 @@ pub fn connector_capture_mode(connector: ConnectorType) -> StreamCaptureMode {
 
 pub fn connector_default_format(connector: ConnectorType) -> &'static str {
     match connector {
-        ConnectorType::Kafka => "json",
+        ConnectorType::Kafka | ConnectorType::Pulsar => "json",
         ConnectorType::Delta | ConnectorType::Filesystem | ConnectorType::Iceberg => "parquet",
     }
 }
 
 fn supported_formats(connector: ConnectorType) -> &'static [&'static str] {
     match connector {
-        ConnectorType::Kafka => &["json"],
+        ConnectorType::Kafka | ConnectorType::Pulsar => &["json"],
         ConnectorType::Delta | ConnectorType::Filesystem | ConnectorType::Iceberg => &["parquet"],
     }
 }
@@ -199,6 +225,25 @@ mod tests {
                     options: crate::model::IcebergSinkOptions::from_ddl(&with).unwrap(),
                 }
             }
+            ConnectorType::Pulsar => {
+                let mut with = std::collections::HashMap::new();
+                with.insert(
+                    "sink.pulsar.topic".into(),
+                    "persistent://public/default/t".into(),
+                );
+                with.insert(
+                    "sink.pulsar.service-url".into(),
+                    "pulsar://localhost:6650".into(),
+                );
+                with.insert(
+                    "sink.pulsar.admin-url".into(),
+                    "http://localhost:8080".into(),
+                );
+                SinkConfig::Pulsar {
+                    format: "json".into(),
+                    options: crate::model::PulsarSinkOptions::from_ddl(&with).unwrap(),
+                }
+            }
         };
         StreamDef {
             name: "s".into(),
@@ -217,6 +262,10 @@ mod tests {
             StreamCaptureMode::Hybrid
         );
         assert_eq!(
+            connector_capture_mode(ConnectorType::Pulsar),
+            StreamCaptureMode::Hybrid
+        );
+        assert_eq!(
             connector_capture_mode(ConnectorType::Delta),
             StreamCaptureMode::Batch
         );
@@ -226,6 +275,7 @@ mod tests {
     fn validates_kafka_and_fs() {
         validate_sink(&minimal_def(ConnectorType::Kafka)).unwrap();
         validate_sink(&minimal_def(ConnectorType::Filesystem)).unwrap();
+        validate_sink(&minimal_def(ConnectorType::Pulsar)).unwrap();
     }
 
     #[test]

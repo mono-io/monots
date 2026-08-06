@@ -48,11 +48,14 @@ iceberg-catalog-rest = { version = "0.4.0", default-features = false }
 iceberg-catalog-glue = { version = "0.4.0", default-features = false }
 uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
+# Pure-Rust Pulsar client (no C++ dependency). Transactions / EOS not available yet.
+pulsar = { version = "6.8", default-features = false, features = ["tokio-runtime", "compression"] }
 
 [dev-dependencies]
 
 [features]
-default = ["kafka", "delta", "iceberg"]
+default = ["kafka", "delta", "iceberg", "pulsar"]
 kafka = []
 delta = []
 iceberg = []
+pulsar = []

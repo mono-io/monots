@@ -320,7 +320,7 @@ fn bool_str(v: bool) -> &'static str {
     }
 }
 
-fn parse_bool(raw: &str) -> Result<bool> {
+pub(crate) fn parse_bool(raw: &str) -> Result<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" => Ok(false),

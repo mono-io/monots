@@ -33,7 +33,9 @@ enum ConnectorType {
   CONNECTOR_TYPE_DELTA = 2;
   CONNECTOR_TYPE_KAFKA = 4;
   CONNECTOR_TYPE_FILESYSTEM = 6;
-  // Next id: 7
+  // New Iceberg connector (id 3 was retired; do not reuse).
+  CONNECTOR_TYPE_ICEBERG_V1 = 7;
+  // Next id: 8
 }
 
 enum StreamCaptureMode {

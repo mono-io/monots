@@ -88,6 +88,8 @@ Docker-backed Kafka / MinIO stream tests **fail** if Docker is unavailable (they
 | `stream_delta_sink` (local SHOW CREATE) | defaults materialization | asserts S3 client defaults + rejects removed keys |
 | `stream_delta_sink` (MinIO) | `s3://` + `sink.delta.endpoint` | Docker MinIO; env credentials; download then LOAD |
 | `stream_delta_sink` (MinIO full SQL) | full `sink.delta.*` DDL knobs | DDL credentials + `3 min` timeout; download then LOAD |
+| `stream_iceberg_sink` (Hadoop+MinIO) | Iceberg Hadoop Catalog | Docker MinIO warehouse; download parquet → LOAD; COUNT/SUM/DISTINCT |
+| `stream_iceberg_sink` (REST+MinIO) | Iceberg REST fixture | Docker `iceberg-rest` + MinIO; same integrity checks |
 | `stream_kafka_sink` | Kafka JSON | Docker Kafka; content-verify JSON rows |
 | `stream_sql_ddl` | — | CREATE / SHOW / DROP STREAM SQL surface |
 

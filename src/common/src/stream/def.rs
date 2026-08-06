@@ -87,6 +87,8 @@ pub enum ConnectorType {
     Kafka,
     /// Export Parquet files to a local directory (`sink.filesystem.path` / `sink.delta.path`).
     Filesystem,
+    /// Apache Iceberg table via Catalog (`sink.iceberg.*`).
+    Iceberg,
 }
 
 impl ConnectorType {
@@ -95,8 +97,9 @@ impl ConnectorType {
             "delta" => Ok(Self::Delta),
             "kafka" => Ok(Self::Kafka),
             "filesystem" | "fs" | "file" => Ok(Self::Filesystem),
+            "iceberg" => Ok(Self::Iceberg),
             other => Err(TsdbError::Query(format!(
-                "unsupported sink.type: {other} (supported: delta | kafka | filesystem)"
+                "unsupported sink.type: {other} (supported: delta | kafka | filesystem | iceberg)"
             ))),
         }
     }
@@ -106,6 +109,7 @@ impl ConnectorType {
             Self::Delta => "delta",
             Self::Kafka => "kafka",
             Self::Filesystem => "filesystem",
+            Self::Iceberg => "iceberg",
         }
     }
 }

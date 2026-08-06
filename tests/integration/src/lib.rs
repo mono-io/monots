@@ -24,8 +24,8 @@ pub use all_types_arrow::{
     enum_value_at, full_types_batch, full_types_columns, full_types_ddl, full_types_schema,
 };
 pub use framework::docker::{
-    require_docker_stack, KAFKA_BOOTSTRAP, MINIO_ACCESS_KEY, MINIO_BUCKET, MINIO_ENDPOINT,
-    MINIO_SECRET_KEY,
+    require_docker_stack, require_iceberg_rest, ICEBERG_REST_URI, ICEBERG_REST_WAREHOUSE_PREFIX,
+    KAFKA_BOOTSTRAP, MINIO_ACCESS_KEY, MINIO_BUCKET, MINIO_ENDPOINT, MINIO_SECRET_KEY,
 };
 pub use framework::instance::{ts_col, unique_table, MonotsInstance};
 pub use helpers::{

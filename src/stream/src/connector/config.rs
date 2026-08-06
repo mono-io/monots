@@ -44,6 +44,9 @@ pub enum ResolvedSinkConfig {
         endpoint: Option<String>,
         options: crate::model::DeltaSinkOptions,
     },
+    Iceberg {
+        options: crate::model::IcebergSinkOptions,
+    },
 }
 
 impl ResolvedSinkConfig {
@@ -105,31 +108,44 @@ impl ResolvedSinkConfig {
                     options,
                 })
             }
+            ConnectorType::Iceberg => {
+                let options = match &def.sink_config {
+                    crate::model::SinkConfig::Iceberg { options } => options.clone(),
+                    _ => {
+                        return Err(TsdbError::Query(
+                            "iceberg sink requires sink.iceberg.* options".into(),
+                        ))
+                    }
+                };
+                Ok(Self::Iceberg { options })
+            }
         }
     }
 }
 
 /// Default capture mode when `cdc.mode` is omitted.
 ///
-/// Kafka defaults to hybrid (batch backfill + WAL tail); filesystem / delta default to batch.
+/// Kafka defaults to hybrid (batch backfill + WAL tail); filesystem / delta / iceberg default to batch.
 pub fn connector_capture_mode(connector: ConnectorType) -> StreamCaptureMode {
     match connector {
         ConnectorType::Kafka => StreamCaptureMode::Hybrid,
-        ConnectorType::Delta | ConnectorType::Filesystem => StreamCaptureMode::Batch,
+        ConnectorType::Delta | ConnectorType::Filesystem | ConnectorType::Iceberg => {
+            StreamCaptureMode::Batch
+        }
     }
 }
 
 pub fn connector_default_format(connector: ConnectorType) -> &'static str {
     match connector {
         ConnectorType::Kafka => "json",
-        ConnectorType::Delta | ConnectorType::Filesystem => "parquet",
+        ConnectorType::Delta | ConnectorType::Filesystem | ConnectorType::Iceberg => "parquet",
     }
 }
 
 fn supported_formats(connector: ConnectorType) -> &'static [&'static str] {
     match connector {
         ConnectorType::Kafka => &["json"],
-        ConnectorType::Delta | ConnectorType::Filesystem => &["parquet"],
+        ConnectorType::Delta | ConnectorType::Filesystem | ConnectorType::Iceberg => &["parquet"],
     }
 }
 
@@ -172,6 +188,17 @@ mod tests {
                 endpoint: None,
                 options: crate::model::DeltaSinkOptions::default(),
             },
+            ConnectorType::Iceberg => {
+                let mut with = std::collections::HashMap::new();
+                with.insert("sink.iceberg.catalog-type".into(), "hadoop".into());
+                with.insert("sink.iceberg.catalog-name".into(), "c".into());
+                with.insert("sink.iceberg.warehouse".into(), "/tmp/wh".into());
+                with.insert("sink.iceberg.namespace".into(), "ns".into());
+                with.insert("sink.iceberg.table".into(), "t".into());
+                SinkConfig::Iceberg {
+                    options: crate::model::IcebergSinkOptions::from_ddl(&with).unwrap(),
+                }
+            }
         };
         StreamDef {
             name: "s".into(),

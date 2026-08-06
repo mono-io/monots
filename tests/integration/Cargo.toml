@@ -28,6 +28,7 @@ tempfile = "3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 pretty_assertions = "1"
+reqwest = { workspace = true }
 
 # ---------------------------------------------------------------------------
 # Integration tests live under tests/<category>/<name>.rs
@@ -153,6 +154,10 @@ path = "tests/stream/delta_sink.rs"
 [[test]]
 name = "stream_kafka_sink"
 path = "tests/stream/kafka_sink.rs"
+
+[[test]]
+name = "stream_iceberg_sink"
+path = "tests/stream/iceberg_sink.rs"
 
 [[test]]
 name = "stream_sql_ddl"

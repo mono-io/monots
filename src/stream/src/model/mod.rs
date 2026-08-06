@@ -17,6 +17,7 @@
 pub mod def;
 pub mod delta_options;
 pub mod event;
+pub mod iceberg_options;
 pub mod kafka_options;
 pub mod metrics;
 pub mod source_spec;
@@ -29,6 +30,9 @@ pub use def::{
 };
 pub use delta_options::DeltaSinkOptions;
 pub use event::{DataEvent, IngressEvent, InsertArrow};
+pub use iceberg_options::{
+    IcebergCatalogType, IcebergSinkOptions, ICEBERG_OPTION_KEYS, ICEBERG_OPTION_PREFIX,
+};
 pub use kafka_options::{
     KafkaDeliveryGuarantee, KafkaPartitioner, KafkaSinkOptions, KAFKA_OPTION_KEYS,
 };

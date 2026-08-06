@@ -184,6 +184,9 @@ impl TryFrom<proto::stream::StreamDef> for StreamDef {
                     &pb.properties,
                 )?,
             },
+            ConnectorType::Iceberg => SinkConfig::Iceberg {
+                options: crate::model::IcebergSinkOptions::from_properties(&pb.properties)?,
+            },
         };
         Ok(Self {
             name: pb.name,
@@ -217,6 +220,7 @@ impl From<&StreamDef> for proto::stream::StreamDef {
                 crate::model::SinkConfig::Filesystem { options, .. } => options
                     .to_properties_prefixed(crate::model::delta_options::FILESYSTEM_OPTION_PREFIX),
                 crate::model::SinkConfig::Kafka { options, .. } => options.to_properties(),
+                crate::model::SinkConfig::Iceberg { options } => options.to_properties(),
             },
             created_at_ms: def.created_at_ms,
             sink_endpoint: def.sink_endpoint().map(|s| s.to_string()),
@@ -309,6 +313,7 @@ fn connector_to_pb(c: ConnectorType) -> proto::stream::ConnectorType {
         ConnectorType::Delta => proto::stream::ConnectorType::Delta,
         ConnectorType::Kafka => proto::stream::ConnectorType::Kafka,
         ConnectorType::Filesystem => proto::stream::ConnectorType::Filesystem,
+        ConnectorType::Iceberg => proto::stream::ConnectorType::IcebergV1,
     }
 }
 
@@ -317,6 +322,7 @@ fn connector_from_pb(v: i32) -> Result<ConnectorType, TsdbError> {
         Ok(proto::stream::ConnectorType::Delta) => Ok(ConnectorType::Delta),
         Ok(proto::stream::ConnectorType::Kafka) => Ok(ConnectorType::Kafka),
         Ok(proto::stream::ConnectorType::Filesystem) => Ok(ConnectorType::Filesystem),
+        Ok(proto::stream::ConnectorType::IcebergV1) => Ok(ConnectorType::Iceberg),
         Ok(proto::stream::ConnectorType::Unspecified) | Err(_) => Err(TsdbError::Storage(format!(
             "unsupported connector_type={v} in stream protobuf"
         ))),

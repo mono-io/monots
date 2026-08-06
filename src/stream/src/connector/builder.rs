@@ -23,7 +23,7 @@ use crate::model::StreamDef;
 
 use super::api::SinkConnector;
 use super::config::ResolvedSinkConfig;
-use super::plugins::{DeltaSink, FilesystemSink, KafkaSink, PayloadFormat};
+use super::plugins::{DeltaSink, FilesystemSink, IcebergSink, KafkaSink, PayloadFormat};
 
 /// Build the physical sink for a stream definition.
 pub fn build_sink(def: &StreamDef) -> Result<Box<dyn SinkConnector>> {
@@ -80,6 +80,9 @@ pub fn build_sink_with_engine(
             endpoint,
             options,
         } => Ok(Box::new(DeltaSink::new(path, table, endpoint, options))),
+        ResolvedSinkConfig::Iceberg { options } => Ok(Box::new(
+            IcebergSink::new(options).map_err(|e| common::TsdbError::Query(e.to_string()))?,
+        )),
     }
 }
 
@@ -128,6 +131,21 @@ mod tests {
             ..kafka.clone()
         };
         let _ = build_sink(&delta).unwrap();
+
+        let mut iceberg_opts = std::collections::HashMap::new();
+        iceberg_opts.insert("sink.iceberg.catalog-type".into(), "hadoop".into());
+        iceberg_opts.insert("sink.iceberg.catalog-name".into(), "c".into());
+        iceberg_opts.insert("sink.iceberg.warehouse".into(), "/tmp/wh".into());
+        iceberg_opts.insert("sink.iceberg.namespace".into(), "ns".into());
+        iceberg_opts.insert("sink.iceberg.table".into(), "t".into());
+        let iceberg = StreamDef {
+            sink_config: SinkConfig::Iceberg {
+                options: crate::model::IcebergSinkOptions::from_ddl(&iceberg_opts).unwrap(),
+            },
+            capture_mode: common::StreamCaptureMode::Batch,
+            ..kafka.clone()
+        };
+        let _ = build_sink(&iceberg).unwrap();
 
         let _ = NoopSink::default();
         let _ = ConnectorType::Kafka;

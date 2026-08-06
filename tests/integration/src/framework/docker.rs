@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Docker Compose helpers for Kafka / MinIO integration tests.
+//! Docker Compose helpers for Kafka / MinIO / Iceberg REST integration tests.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,6 +29,10 @@ pub const MINIO_ENDPOINT: &str = "http://127.0.0.1:19000";
 pub const MINIO_ACCESS_KEY: &str = "minioadmin";
 pub const MINIO_SECRET_KEY: &str = "minioadmin";
 pub const MINIO_BUCKET: &str = "monots";
+/// Iceberg REST Catalog fixture on the host (`iceberg-rest` service).
+pub const ICEBERG_REST_URI: &str = "http://127.0.0.1:18181";
+/// Warehouse prefix used by the REST fixture (inside [`MINIO_BUCKET`]).
+pub const ICEBERG_REST_WAREHOUSE_PREFIX: &str = "iceberg-rest-warehouse";
 
 static COMPOSE_FILE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -90,7 +94,6 @@ fn compose_run(args: &[&str]) -> Result<(), String> {
 
 /// Bring up Kafka + MinIO and wait until host ports accept TCP.
 pub async fn ensure_stack_up() -> Result<(), String> {
-    // Prefer kafka+minio; minio-init is best-effort (mirror may lack `mc` tags).
     compose_run(&["up", "-d", "kafka", "minio"])?;
     let _ = compose_run(&["up", "-d", "minio-init"]);
 
@@ -121,8 +124,50 @@ pub async fn ensure_stack_up() -> Result<(), String> {
     }
 }
 
+/// Bring up Kafka + MinIO + Iceberg REST fixture.
+pub async fn ensure_iceberg_stack_up() -> Result<(), String> {
+    ensure_stack_up().await?;
+    compose_run(&["up", "-d", "iceberg-rest"])?;
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let rest_ok = wait_for_port(
+            "127.0.0.1:18181",
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+        )
+        .await;
+        if rest_ok {
+            // Confirm the catalog HTTP API is live (not just the port).
+            let url = format!("{ICEBERG_REST_URI}/v1/config");
+            match reqwest::get(&url).await {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) => {
+                    if Instant::now() > deadline {
+                        return Err(format!(
+                            "Iceberg REST /v1/config returned HTTP {}",
+                            resp.status()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    if Instant::now() > deadline {
+                        return Err(format!("GET {url} failed: {e}"));
+                    }
+                }
+            }
+        }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "Iceberg REST Catalog not ready within 180s at {ICEBERG_REST_URI} \
+                 (rest_port={rest_ok})"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 async fn ensure_minio_bucket() -> Result<(), String> {
-    // Prefer dockerized `mc` on the compose network (works even when host mc is absent).
     let script = format!(
         "mc alias set local http://minio:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} && \
          mc mb -p local/{MINIO_BUCKET} || true"
@@ -141,7 +186,6 @@ async fn ensure_minio_bucket() -> Result<(), String> {
         .output()
         .map_err(|e| format!("docker run minio/mc failed: {e}"))?;
     if !out.status.success() {
-        // Fall back: probe with object_store put (bucket may already exist).
         return ensure_minio_bucket_via_put().await.map_err(|e| {
             format!(
                 "mc bucket ensure failed ({}): {}\nfallback put also failed: {e}",
@@ -183,4 +227,9 @@ pub fn stack_down() {
 /// Fail hard unless Kafka + MinIO compose stack is up (no soft-skip).
 pub async fn require_docker_stack() -> Result<(), String> {
     ensure_stack_up().await
+}
+
+/// Fail hard unless Iceberg REST Catalog fixture is up (implies MinIO).
+pub async fn require_iceberg_rest() -> Result<(), String> {
+    ensure_iceberg_stack_up().await
 }

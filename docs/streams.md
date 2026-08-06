@@ -42,7 +42,7 @@ Every stream requires a `WITH` clause to define its sink and capture behavior.
 
 | Property       | Required | Description                                                                                                                               |
 |----------------|----------|-------------------------------------------------------------------------------------------------------------------------------------------|
-| `sink.type`    | Yes      | Destination type: `filesystem`, `delta`, or `kafka`.                                                                                      |
+| `sink.type`    | Yes      | Destination type: `filesystem`, `delta`, `kafka`, or `iceberg`.                                                                              |
 | `source.table` | Yes      | The name of the table to capture.                                                                                                         |
 | `cdc.mode`     | No       | `batch` (historical Parquet files only) or `hybrid` (historical files + live WAL tailing). Defaults depend on the sink.                   |
 | `cdc.auto_end` | No       | `true` or `false` (default). If `true`, the stream automatically terminates after the current historical export finishes (one-shot mode). |
@@ -183,11 +183,68 @@ CREATE STREAM metrics_fs_s3 WITH (
 
 ---
 
+## Sink: Iceberg (`sink.type = 'iceberg'`)
+
+Writes Apache Iceberg tables through a Catalog (Flink-compatible options). Warehouse may be a local path or `s3://` / `s3a://` (with optional MinIO endpoint).
+
+- **Default `cdc.mode`:** `batch`
+- **Default `sink.format`:** `parquet`
+
+| Property | Required | Description |
+|----------|----------|-------------|
+| `sink.iceberg.catalog-type` | Yes | `hive` \| `hadoop` \| `rest` \| `glue`. |
+| `sink.iceberg.catalog-name` | Yes | Catalog name registered inside MonoTS / Flink-style identity. |
+| `sink.iceberg.uri` | hive / rest | Metastore thrift URI (`thrift://host:9083`) or REST catalog endpoint. |
+| `sink.iceberg.warehouse` | hadoop (required); others optional | Physical warehouse root (`/data/iceberg`, `s3://bucket/wh`, …). **Required for glue** writes. |
+| `sink.iceberg.namespace` | Yes | Iceberg namespace / database (dot or `/` separators allowed). |
+| `sink.iceberg.table` | Yes | Table name. |
+| `sink.iceberg.create-table-if-not-exists` | No (`true`) | Create the table from the first Parquet schema when missing. |
+| `sink.iceberg.endpoint` | No | S3-compatible endpoint for warehouse object storage. |
+| `sink.iceberg.access.key` / `secret.key` / `region` / … | No | Same industrial S3 client knobs as Delta (`path.style.access`, `connection.*`, `attempts.maximum`). |
+
+**Catalog write support**
+
+| Type | Connect | Append commits |
+|------|---------|----------------|
+| `hadoop` | Yes (warehouse + `version-hint.text`) | Yes |
+| `rest` | Yes | Yes |
+| `glue` | Yes | No (`update_table` missing in iceberg-catalog-glue 0.4) |
+| `hive` | DDL accepted | Not available in this build (HMS thrift client incompatible with current rustc); use `hadoop` or `rest` |
+
+```sql
+CREATE STREAM metrics_iceberg WITH (
+  'sink.type' = 'iceberg',
+  'sink.iceberg.catalog-type' = 'hadoop',
+  'sink.iceberg.catalog-name' = 'my_hive_catalog',
+  'sink.iceberg.warehouse' = '/tmp/iceberg-warehouse',
+  'sink.iceberg.namespace' = 'db',
+  'sink.iceberg.table' = 'metrics',
+  'source.table' = 'metrics'
+);
+```
+
+```sql
+CREATE STREAM metrics_iceberg_s3 WITH (
+  'sink.type' = 'iceberg',
+  'sink.iceberg.catalog-type' = 'hadoop',
+  'sink.iceberg.catalog-name' = 'lake',
+  'sink.iceberg.warehouse' = 's3://monots/iceberg',
+  'sink.iceberg.endpoint' = 'http://127.0.0.1:9000',
+  'sink.iceberg.access.key' = 'minioadmin',
+  'sink.iceberg.secret.key' = 'minioadmin',
+  'sink.iceberg.namespace' = 'db',
+  'sink.iceberg.table' = 'metrics',
+  'source.table' = 'metrics'
+);
+```
+
+---
+
 ## Operations Guide
 
 ### The Role of `FLUSH TABLE` (For Batch Modes)
 
-For sinks operating in `batch` mode (default for Filesystem and Delta), MonoTS only exports immutable Parquet SST files. Data residing in live MemTables will not be captured until it is flushed.
+For sinks operating in `batch` mode (default for Filesystem, Delta, and Iceberg), MonoTS only exports immutable Parquet SST files. Data residing in live MemTables will not be captured until it is flushed.
 
 To force a capture immediately, run:
 

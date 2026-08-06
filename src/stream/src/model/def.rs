@@ -17,6 +17,7 @@
 use common::{ConnectorType, Result, StreamCaptureMode, TsdbError};
 
 use super::delta_options::{DeltaSinkOptions, DELTA_OPTION_KEYS, FILESYSTEM_OPTION_KEYS};
+use super::iceberg_options::{IcebergSinkOptions, ICEBERG_OPTION_KEYS};
 use super::kafka_options::{KafkaSinkOptions, KAFKA_OPTION_KEYS};
 
 /// Pure stream configuration (persisted in `streams/*.pb`).
@@ -31,7 +32,7 @@ pub struct StreamDef {
     pub auto_end: bool,
 }
 
-/// Strongly-typed downstream sink config (Delta / Kafka / Filesystem).
+/// Strongly-typed downstream sink config (Delta / Kafka / Filesystem / Iceberg).
 #[derive(Debug, Clone)]
 pub enum SinkConfig {
     Kafka {
@@ -53,6 +54,8 @@ pub enum SinkConfig {
         /// S3 client knobs when `path` is an object URI (same industrial defaults as Delta).
         options: DeltaSinkOptions,
     },
+    /// Apache Iceberg table via Catalog (`sink.iceberg.*`).
+    Iceberg { options: IcebergSinkOptions },
 }
 
 impl SinkConfig {
@@ -61,19 +64,21 @@ impl SinkConfig {
             Self::Kafka { .. } => ConnectorType::Kafka,
             Self::Delta { .. } => ConnectorType::Delta,
             Self::Filesystem { .. } => ConnectorType::Filesystem,
+            Self::Iceberg { .. } => ConnectorType::Iceberg,
         }
     }
 
     pub fn delivery_format(&self) -> &str {
         match self {
             Self::Kafka { format, .. } => format.as_str(),
-            Self::Delta { .. } | Self::Filesystem { .. } => "parquet",
+            Self::Delta { .. } | Self::Filesystem { .. } | Self::Iceberg { .. } => "parquet",
         }
     }
 
     pub fn sink_path(&self) -> Option<&str> {
         match self {
             Self::Delta { path, .. } | Self::Filesystem { path, .. } => Some(path.as_str()),
+            Self::Iceberg { options } => options.warehouse.as_deref(),
             Self::Kafka { .. } => None,
         }
     }
@@ -107,6 +112,7 @@ impl SinkConfig {
             | Self::Filesystem {
                 endpoint: Some(ep), ..
             } if !ep.is_empty() => Some(ep.as_str()),
+            Self::Iceberg { options } => options.endpoint.as_deref().filter(|s| !s.is_empty()),
             _ => None,
         }
     }
@@ -114,6 +120,14 @@ impl SinkConfig {
     pub fn delta_options(&self) -> Option<&DeltaSinkOptions> {
         match self {
             Self::Delta { options, .. } | Self::Filesystem { options, .. } => Some(options),
+            Self::Iceberg { options } => Some(&options.object_store),
+            _ => None,
+        }
+    }
+
+    pub fn iceberg_options(&self) -> Option<&IcebergSinkOptions> {
+        match self {
+            Self::Iceberg { options } => Some(options),
             _ => None,
         }
     }
@@ -182,6 +196,18 @@ impl StreamDef {
                     }
                 }
             }
+            SinkConfig::Iceberg { options } => {
+                if options
+                    .endpoint
+                    .as_ref()
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true)
+                {
+                    if let Some(ep) = endpoint.filter(|s| !s.is_empty()) {
+                        options.endpoint = Some(ep);
+                    }
+                }
+            }
             _ => {}
         }
         self
@@ -229,7 +255,7 @@ fn reject_legacy_keys(options: &HashMap<String, String>) -> Result<()> {
         return Ok(());
     }
     Err(TsdbError::Query(format!(
-        "unsupported options {} (use sink.delta.|sink.filesystem.|sink.kafka. prefixed keys)",
+        "unsupported options {} (use sink.delta.|sink.filesystem.|sink.kafka.|sink.iceberg. prefixed keys)",
         present.join(", ")
     )))
 }
@@ -243,57 +269,58 @@ fn reject_foreign_sink_keys(
     let delta_keys = ["sink.delta.path", "sink.delta.endpoint"];
     let fs_keys = ["sink.filesystem.path", "sink.filesystem.endpoint"];
     let kafka_keys = ["sink.kafka.brokers", "sink.kafka.topic"];
+    let iceberg_core = [
+        "sink.iceberg.catalog-type",
+        "sink.iceberg.catalog-name",
+        "sink.iceberg.uri",
+        "sink.iceberg.warehouse",
+        "sink.iceberg.namespace",
+        "sink.iceberg.table",
+        "sink.iceberg.create-table-if-not-exists",
+        "sink.iceberg.endpoint",
+    ];
 
-    let bad = match connector {
-        ConnectorType::Delta => {
-            let mut v = Vec::new();
-            if has_any_key(options, &fs_keys) {
-                v.extend_from_slice(&fs_keys);
-            }
-            if has_any_key(options, FILESYSTEM_OPTION_KEYS) {
-                v.extend_from_slice(FILESYSTEM_OPTION_KEYS);
-            }
-            if has_any_key(options, &kafka_keys) {
-                v.extend_from_slice(&kafka_keys);
-            }
-            if has_any_key(options, KAFKA_OPTION_KEYS) {
-                v.extend_from_slice(KAFKA_OPTION_KEYS);
-            }
-            v
-        }
-        ConnectorType::Filesystem => {
-            let mut v = Vec::new();
-            if has_any_key(options, &delta_keys) {
-                v.extend_from_slice(&delta_keys);
-            }
-            if has_any_key(options, DELTA_OPTION_KEYS) {
-                v.extend_from_slice(DELTA_OPTION_KEYS);
-            }
-            if has_any_key(options, &kafka_keys) {
-                v.extend_from_slice(&kafka_keys);
-            }
-            if has_any_key(options, KAFKA_OPTION_KEYS) {
-                v.extend_from_slice(KAFKA_OPTION_KEYS);
-            }
-            v
-        }
-        ConnectorType::Kafka => {
-            let mut v = Vec::new();
-            if has_any_key(options, &delta_keys) {
-                v.extend_from_slice(&delta_keys);
-            }
-            if has_any_key(options, DELTA_OPTION_KEYS) {
-                v.extend_from_slice(DELTA_OPTION_KEYS);
-            }
-            if has_any_key(options, &fs_keys) {
-                v.extend_from_slice(&fs_keys);
-            }
-            if has_any_key(options, FILESYSTEM_OPTION_KEYS) {
-                v.extend_from_slice(FILESYSTEM_OPTION_KEYS);
-            }
-            v
+    let mut bad: Vec<&str> = Vec::new();
+    let mut push_if = |keys: &[&'static str]| {
+        if has_any_key(options, keys) {
+            bad.extend_from_slice(keys);
         }
     };
+
+    match connector {
+        ConnectorType::Delta => {
+            push_if(&fs_keys);
+            push_if(FILESYSTEM_OPTION_KEYS);
+            push_if(&kafka_keys);
+            push_if(KAFKA_OPTION_KEYS);
+            push_if(&iceberg_core);
+            push_if(ICEBERG_OPTION_KEYS);
+        }
+        ConnectorType::Filesystem => {
+            push_if(&delta_keys);
+            push_if(DELTA_OPTION_KEYS);
+            push_if(&kafka_keys);
+            push_if(KAFKA_OPTION_KEYS);
+            push_if(&iceberg_core);
+            push_if(ICEBERG_OPTION_KEYS);
+        }
+        ConnectorType::Kafka => {
+            push_if(&delta_keys);
+            push_if(DELTA_OPTION_KEYS);
+            push_if(&fs_keys);
+            push_if(FILESYSTEM_OPTION_KEYS);
+            push_if(&iceberg_core);
+            push_if(ICEBERG_OPTION_KEYS);
+        }
+        ConnectorType::Iceberg => {
+            push_if(&delta_keys);
+            push_if(DELTA_OPTION_KEYS);
+            push_if(&fs_keys);
+            push_if(FILESYSTEM_OPTION_KEYS);
+            push_if(&kafka_keys);
+            push_if(KAFKA_OPTION_KEYS);
+        }
+    }
 
     let present: Vec<&str> = bad
         .into_iter()
@@ -306,11 +333,7 @@ fn reject_foreign_sink_keys(
         "options {} are not valid for sink.type = {} (use sink.{}.… for sink-specific keys)",
         present.join(", "),
         connector.as_str(),
-        match connector {
-            ConnectorType::Delta => "delta",
-            ConnectorType::Filesystem => "filesystem",
-            ConnectorType::Kafka => "kafka",
-        }
+        connector.as_str()
     )))
 }
 
@@ -403,6 +426,9 @@ pub fn parse_stream_def(
                 options: fs_opts,
             }
         }
+        ConnectorType::Iceberg => SinkConfig::Iceberg {
+            options: IcebergSinkOptions::from_ddl(options)?,
+        },
     };
 
     let def = StreamDef {
@@ -540,7 +566,7 @@ mod tests {
 
     #[test]
     fn unsupported_connector_types_are_rejected() {
-        for connector in ["monots", "json", "iceberg"] {
+        for connector in ["monots", "json"] {
             let err = parse_stream_def(
                 "s".into(),
                 &opts(&[
@@ -554,6 +580,27 @@ mod tests {
             .to_string();
             assert!(err.contains("unsupported sink.type"), "{err}");
         }
+    }
+
+    #[test]
+    fn iceberg_hadoop_parses() {
+        let def = parse_stream_def(
+            "s".into(),
+            &opts(&[
+                ("sink.type", "iceberg"),
+                ("source.table", "t"),
+                ("sink.iceberg.catalog-type", "hadoop"),
+                ("sink.iceberg.catalog-name", "my_hive_catalog"),
+                ("sink.iceberg.warehouse", "/tmp/iceberg-wh"),
+                ("sink.iceberg.namespace", "db"),
+                ("sink.iceberg.table", "metrics"),
+            ]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(def.capture_mode, StreamCaptureMode::Batch);
+        assert_eq!(def.delivery_format(), "parquet");
+        assert!(matches!(def.sink_config, SinkConfig::Iceberg { .. }));
     }
 
     #[test]

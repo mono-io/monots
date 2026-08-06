@@ -40,11 +40,19 @@ rdkafka = { version = "0.37", features = ["cmake-build", "tokio", "curl"] }
 # `s3` enables official s3:// / MinIO handlers (requires rustc >= 1.94.1 — see rust-toolchain.toml).
 deltalake = { version = "0.22.3", default-features = false, features = ["s3"] }
 object_store = { version = "0.11", features = ["aws"] }
-
-[dev-dependencies]
+# Arrow-53 compatible Iceberg stack (0.5+ bumps Arrow).
+# Note: iceberg-catalog-hms 0.4 pulls hive_metastore which fails to compile on
+# modern rustc (Default derives). Hive DDL is accepted; runtime asks for rest/hadoop.
+iceberg = { version = "0.4.0", default-features = false }
+iceberg-catalog-rest = { version = "0.4.0", default-features = false }
+iceberg-catalog-glue = { version = "0.4.0", default-features = false }
+uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
 
+[dev-dependencies]
+
 [features]
-default = ["kafka", "delta"]
+default = ["kafka", "delta", "iceberg"]
 kafka = []
 delta = []
+iceberg = []

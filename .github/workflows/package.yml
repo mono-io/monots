@@ -41,12 +41,18 @@ on:
         type: boolean
         default: false
 
+# Multi-arch release builds are expensive (esp. Windows cold cache). Do not
+# cancel in-flight runs on push/tag — that yields cryptic "operation was canceled"
+# mid-cargo. PRs may still cancel on force-push.
 concurrency:
   group: package-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
+  # Faster CI release builds; local `make dist` still uses opt-level=z.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
 jobs:
   resolve-version:
@@ -98,7 +104,8 @@ jobs:
   package-native:
     name: native (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    # Windows cold cache (aws-lc / rdkafka / datafusion) regularly exceeds 2h.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
@@ -106,18 +113,23 @@ jobs:
           - name: linux-x86_64-gnu
             os: ubuntu-24.04
             triple: x86_64-unknown-linux-gnu
+            timeout_minutes: 120
           - name: linux-aarch64-gnu
             os: ubuntu-24.04-arm
             triple: aarch64-unknown-linux-gnu
+            timeout_minutes: 120
           - name: darwin-aarch64
             os: macos-15
             triple: aarch64-apple-darwin
+            timeout_minutes: 120
           - name: darwin-x86_64
             os: macos-15-intel
             triple: x86_64-apple-darwin
+            timeout_minutes: 150
           - name: windows-x86_64
             os: windows-2022
             triple: x86_64-pc-windows-msvc
+            timeout_minutes: 360
     steps:
       - uses: actions/checkout@v4
 
@@ -136,15 +148,20 @@ jobs:
 
       - name: Install system dependencies (Windows)
         if: runner.os == 'Windows'
-        run: choco install protoc cmake -y
+        run: |
+          # nasm: aws-lc-sys; cmake/protoc: rdkafka / tonic
+          choco install nasm protoc cmake -y --no-progress
+          echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         shell: pwsh
 
       - uses: dtolnay/rust-toolchain@1.94.1
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: monots-cargo-v1
+          prefix-key: monots-cargo-v2
           shared-key: package-native-${{ matrix.name }}
+          cache-targets: "true"
+          cache-all-crates: "true"
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build and package (Unix)
@@ -154,12 +171,15 @@ jobs:
       - name: Build and package (Windows)
         if: runner.os == 'Windows'
         shell: bash
+        env:
+          # Keep MSVC link / aws-lc quieter and avoid hanging child tools.
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: |
           set -euo pipefail
           VERSION="$(grep '^version' Cargo.toml | head -1 | awk -F '"' '{print $2}')"
           TRIPLE="${{ matrix.triple }}"
           NAME="monots-${VERSION}-${TRIPLE}"
-          cargo build --release -p server -p cli
+          cargo build --release --locked -p server -p cli
           mkdir -p "dist/${NAME}/bin" "dist/${NAME}/conf" "dist/${NAME}/data" "dist/${NAME}/logs"
           cp target/release/monots-server.exe "dist/${NAME}/bin/"
           cp target/release/monots.exe "dist/${NAME}/bin/"

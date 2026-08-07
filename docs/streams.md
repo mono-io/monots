@@ -1,6 +1,6 @@
 # MonoTS Streams (CDC) Reference
 
-MonoTS Change Data Capture (CDC) Streams allow you to continuously push table changes to downstream systems like Delta Lake, Kafka, Pulsar, Iceberg, or local filesystems.
+MonoTS Change Data Capture (CDC) Streams allow you to continuously push table changes to downstream systems like Delta Lake, Kafka, Pulsar, MQTT, Iceberg, or local filesystems.
 
 Delivery is **server-driven** (push model) with **at-least-once** guarantees. There is no client-side pull API.
 
@@ -42,7 +42,7 @@ Every stream requires a `WITH` clause to define its sink and capture behavior.
 
 | Property       | Required | Description                                                                                                                               |
 |----------------|----------|-------------------------------------------------------------------------------------------------------------------------------------------|
-| `sink.type`    | Yes      | Destination type: `filesystem`, `delta`, `kafka`, `iceberg`, or `pulsar`.                                                                    |
+| `sink.type`    | Yes      | Destination type: `filesystem`, `delta`, `kafka`, `iceberg`, `pulsar`, or `mqtt`.                                                           |
 | `source.table` | Yes      | The name of the table to capture.                                                                                                         |
 | `cdc.mode`     | No       | `batch` (historical Parquet files only) or `hybrid` (historical files + live WAL tailing). Defaults depend on the sink.                   |
 | `cdc.auto_end` | No       | `true` or `false` (default). If `true`, the stream automatically terminates after the current historical export finishes (one-shot mode). |
@@ -258,24 +258,22 @@ CREATE STREAM metrics_iceberg_rest WITH (
 
 ## Sink: Pulsar (`sink.type = 'pulsar'`)
 
-Pushes change events as row-level JSON messages to an Apache Pulsar topic (pure-Rust `pulsar` client). Options mirror the Flink Pulsar connector under the `sink.pulsar.*` prefix.
+Pushes change events as row-level JSON messages to an Apache Pulsar topic (pure-Rust `pulsar` client). Options use the `sink.pulsar.*` prefix.
 
 - **Default `cdc.mode`:** `hybrid`
 - **Default `sink.format`:** `json`
-- **Default delivery:** `at-least-once` (await broker send receipt). `none` enqueues without waiting. `exactly-once` is rejected for now — the Rust client has no Transaction API (Flink EOS needs `transactionCoordinatorEnabled=true` on the broker).
+- **Default delivery:** `at-least-once` (await broker send receipt). `none` enqueues without waiting.
 
 | Property | Default | Description |
 |----------|---------|-------------|
 | `sink.pulsar.topic` | *(required)* | Full topic name, e.g. `persistent://public/default/my-topic`. |
 | `sink.pulsar.service-url` | *(required)* | Broker URL (`pulsar://host:6650` or `pulsar+ssl://…`). |
 | `sink.pulsar.admin-url` | *(required)* | Admin HTTP API (`http://host:8080`); used for health/metadata probes. |
-| `sink.pulsar.delivery-guarantee` | `at-least-once` | `none` \| `at-least-once` \| `exactly-once` (EOS not available yet). |
-| `sink.pulsar.transaction-timeout` | — | Flink-style duration (`3 h`, `15m`) or milliseconds; stored for EOS when available. |
-| `sink.pulsar.message-router` | `round-robin` | `round-robin` \| `single` \| `key-hash` (requires `key.fields`). Java `custom` routers are not supported. |
+| `sink.pulsar.delivery-guarantee` | `at-least-once` | `none` \| `at-least-once`. |
 | `sink.pulsar.key.format` | — | Key serialization; only `json` when keys are enabled. |
 | `sink.pulsar.key.fields` | — | Comma-separated columns used as the Pulsar partition key. |
 | `sink.pulsar.key.fields-prefix` | `""` | Prefix applied to key JSON field names. |
-| `sink.pulsar.auth-plugin` | — | e.g. `org.apache.pulsar.client.impl.auth.AuthenticationToken`. |
+| `sink.pulsar.auth-plugin` | — | Token auth: `AuthenticationToken` / `token`. |
 | `sink.pulsar.auth-params` | — | Token auth params (`token:<jwt>` or raw token / `{"token":"…"}`). |
 
 ```sql
@@ -285,9 +283,43 @@ CREATE STREAM metrics_pulsar WITH (
   'sink.pulsar.service-url' = 'pulsar://127.0.0.1:6650',
   'sink.pulsar.admin-url' = 'http://127.0.0.1:8080',
   'sink.pulsar.delivery-guarantee' = 'at-least-once',
-  'sink.pulsar.message-router' = 'key-hash',
   'sink.pulsar.key.format' = 'json',
   'sink.pulsar.key.fields' = 'order_id',
+  'source.table' = 'metrics'
+);
+```
+
+---
+
+## Sink: MQTT (`sink.type = 'mqtt'`)
+
+Publishes change events as row-level JSON messages to an MQTT broker (pure-Rust `rumqttc` client). Options use the `sink.mqtt.*` prefix.
+
+- **Default `cdc.mode`:** `hybrid`
+- **Default `sink.format`:** `json`
+- **Default QoS:** `1` (at-least-once). `0` is fire-and-forget; `2` is exactly-once handshake (slowest).
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `sink.mqtt.url` / `sink.mqtt.server-uri` | *(required)* | Broker URL: `tcp://` / `mqtt://` / `ssl://` / `mqtts://` / `ws://` / `wss://` (WebSocket path kept, e.g. `ws://host:8083/mqtt`). |
+| `sink.mqtt.topic` | *(required)* | Publish topic, e.g. `sensor/temp/out`. |
+| `sink.mqtt.client-id` | auto `monots-<uuid>` | MQTT client id. Provide a unique id per parallel worker in distributed setups. |
+| `sink.mqtt.username` | — | Username for broker auth. |
+| `sink.mqtt.password` | — | Password (requires username). |
+| `sink.mqtt.clean-session` | `true` | Recommended `true` for sinks (no offline message queue). |
+| `sink.mqtt.qos` | `1` | `0` \| `1` \| `2`. |
+| `sink.mqtt.retained` | `false` | Publish as a retained message. |
+| `sink.mqtt.connection-timeout` | `30` | Connect timeout in seconds. |
+| `sink.mqtt.keep-alive-interval` | `60` | Keep-alive heartbeat interval in seconds. |
+| `sink.mqtt.max-inflight` | `1000` | Max in-flight QoS>0 publishes. |
+
+```sql
+CREATE STREAM metrics_mqtt WITH (
+  'sink.type' = 'mqtt',
+  'sink.mqtt.url' = 'tcp://127.0.0.1:1883',
+  'sink.mqtt.topic' = 'sensor/temp/out',
+  'sink.mqtt.qos' = '1',
+  'sink.mqtt.clean-session' = 'true',
   'source.table' = 'metrics'
 );
 ```

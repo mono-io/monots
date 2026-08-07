@@ -30,3 +30,6 @@ tikv-jemallocator = "0.6"
 [features]
 # Enable heap allocation profiling (writes dhat-heap.json on exit).
 dhat-heap = ["dep:dhat"]
+
+[lints]
+workspace = true

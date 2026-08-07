@@ -82,7 +82,10 @@ impl IcebergSink {
             let handle = build_catalog(&self.options).await?;
             self.catalog = Some(handle);
         }
-        Ok(self.catalog.as_ref().expect("just set"))
+        Ok(self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| SinkError::Fatal("Iceberg catalog missing after ensure".into()))?)
     }
 
     async fn ensure_table(&mut self, schema_hint: Option<&IcebergSchema>) -> Result<(), SinkError> {

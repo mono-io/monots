@@ -122,3 +122,12 @@ services:
     environment:
       PULSAR_MEM: "-Xms512m -Xmx512m"
     # Port readiness is verified by the Rust IT harness.
+
+  # Eclipse Mosquitto MQTT broker (anonymous TCP :1883).
+  mosquitto:
+    image: eclipse-mosquitto:2.0.20
+    container_name: monots-it-mosquitto
+    ports:
+      - "11883:1883"
+    volumes:
+      - ./fixtures/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro

@@ -21,7 +21,8 @@ arrow = { workspace = true }
 parquet = { workspace = true }
 libc = "0.2"
 rdkafka = { version = "0.37", features = ["cmake-build", "tokio", "curl"] }
-pulsar = { version = "6.8", default-features = false, features = ["tokio-runtime", "compression"] }
+pulsar = { version = "6.3.1", default-features = false, features = ["tokio-runtime", "compression"] }
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls", "websocket"] }
 futures = "0.3"
 object_store = { version = "0.11", features = ["aws"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
@@ -166,6 +167,10 @@ name = "stream_pulsar_sink"
 path = "tests/stream/pulsar_sink.rs"
 
 [[test]]
+name = "stream_mqtt_sink"
+path = "tests/stream/mqtt_sink.rs"
+
+[[test]]
 name = "stream_sql_ddl"
 path = "tests/stream/sql_ddl.rs"
 
@@ -173,3 +178,6 @@ path = "tests/stream/sql_ddl.rs"
 [[test]]
 name = "recovery_restart"
 path = "tests/recovery/restart.rs"
+
+[lints]
+workspace = true

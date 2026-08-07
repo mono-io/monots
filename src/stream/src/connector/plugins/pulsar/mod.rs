@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Pulsar sink: JSON payloads with Flink-style delivery / routing / key options.
+//! Pulsar sink: JSON payloads with delivery / key / token-auth options.
 //!
 //! Delivery:
 //! - `none` — enqueue without awaiting broker receipt
 //! - `at-least-once` — await send receipt (default)
-//! - `exactly-once` — rejected at DDL (Rust client has no Transaction API)
 //!
-//! Message routing maps to pulsar-rs [`RoutingPolicy`]. `admin-url` is used for
+//! Optional `key.fields` set the Pulsar `partition_key`. `admin-url` is used for
 //! HTTP health preflight; produce traffic uses `service-url`.
 
 use std::sync::Arc;
@@ -27,16 +26,14 @@ use std::sync::Arc;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_json::LineDelimitedWriter;
-use futures::{stream::FuturesUnordered, StreamExt};
 use pulsar::producer::{self, Producer, ProducerOptions};
-use pulsar::routing_policy::{CustomRoutingPolicy, RoutingPolicy};
 use pulsar::{Authentication, Error as PulsarError, Pulsar, SerializeMessage, TokioExecutor};
 use tracing::{debug, info, warn};
 
 use crate::connector::api::{SinkConnector, SinkError};
 use crate::data::StreamArrowLoader;
 use crate::model::event::{DataEvent, InsertArrow};
-use crate::model::{PulsarDeliveryGuarantee, PulsarMessageRouter, PulsarSinkOptions};
+use crate::model::{PulsarDeliveryGuarantee, PulsarSinkOptions};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PayloadFormat {
@@ -66,20 +63,6 @@ impl SerializeMessage for PulsarRecord {
             partition_key: input.key,
             ..Default::default()
         })
-    }
-}
-
-struct KeyHashRouter;
-
-impl CustomRoutingPolicy for KeyHashRouter {
-    fn route(&self, message: &producer::Message, num_producers: usize) -> usize {
-        if num_producers == 0 {
-            return 0;
-        }
-        match &message.partition_key {
-            Some(key) => RoutingPolicy::compute_partition_index_for_key(key, num_producers),
-            None => 0,
-        }
     }
 }
 
@@ -175,14 +158,6 @@ fn encode_records(
     }
 }
 
-fn routing_policy(router: PulsarMessageRouter) -> RoutingPolicy {
-    match router {
-        PulsarMessageRouter::RoundRobin => RoutingPolicy::RoundRobin,
-        PulsarMessageRouter::Single => RoutingPolicy::Single,
-        PulsarMessageRouter::KeyHash => RoutingPolicy::Custom(Arc::new(KeyHashRouter)),
-    }
-}
-
 pub struct PulsarSink {
     format: PayloadFormat,
     options: PulsarSinkOptions,
@@ -221,7 +196,6 @@ impl PulsarSink {
             admin_url = %self.options.admin_url,
             topic = %self.options.topic,
             delivery = %self.options.delivery_guarantee.as_str(),
-            router = %self.options.message_router.as_str(),
             "PulsarSink establishing producer"
         );
 
@@ -240,9 +214,10 @@ impl PulsarSink {
             });
         }
 
-        let client = builder.build().await.map_err(|e| {
-            SinkError::Transient(format!("Pulsar client connect failed: {e}"))
-        })?;
+        let client = builder
+            .build()
+            .await
+            .map_err(|e| SinkError::Transient(format!("Pulsar client connect failed: {e}")))?;
 
         // Topic lookup fails fast when the broker/topic is unreachable.
         client
@@ -254,10 +229,7 @@ impl PulsarSink {
             .producer()
             .with_topic(self.options.topic.clone())
             .with_name(format!("monots-{}", uuid::Uuid::new_v4()))
-            .with_options(ProducerOptions {
-                routing_policy: Some(routing_policy(self.options.message_router)),
-                ..Default::default()
-            })
+            .with_options(ProducerOptions::default())
             .build()
             .await
             .map_err(|e| SinkError::Transient(format!("Pulsar producer create failed: {e}")))?;
@@ -288,7 +260,6 @@ impl PulsarSink {
             PulsarDeliveryGuarantee::None
         );
 
-        // Scope the producer borrow so we can drop handles on failure afterwards.
         let delivery_result = {
             let producer = match self.producer.as_mut() {
                 Some(p) => p,
@@ -298,52 +269,40 @@ impl PulsarSink {
                     ))
                 }
             };
-            #[allow(unused_mut)] // FuturesUnordered::push needs &mut; rustc may not see it in async.
-            let mut futs = Vec::new();
-            let mut enqueue_err: Option<SinkError> = None;
+
+            // Sequential send: await each receipt before the next enqueue when
+            // at-least-once, so we never drop in-flight futures and close the
+            // producer underneath them.
+            let mut sent = 0usize;
+            let mut err: Option<SinkError> = None;
             for rec in records {
                 match producer.send_non_blocking(rec).await {
-                    Ok(fut) => futs.push(fut),
+                    Ok(fut) => {
+                        if wait_receipt {
+                            if let Err(e) = fut.await {
+                                err = Some(SinkError::Transient(format!(
+                                    "Pulsar delivery failed: {e}"
+                                )));
+                                break;
+                            }
+                        }
+                        sent += 1;
+                    }
                     Err(e) => {
-                        enqueue_err = Some(SinkError::Transient(format!(
-                            "Pulsar enqueue failed: {e}"
-                        )));
+                        err = Some(SinkError::Transient(format!("Pulsar enqueue failed: {e}")));
                         break;
                     }
                 }
             }
-            match enqueue_err {
+            match err {
                 Some(e) => Err(e),
-                None => {
-                    let mut pending = FuturesUnordered::new();
-                    for fut in futs {
-                        pending.push(fut);
-                    }
-                    Ok((pending, wait_receipt))
-                }
+                None => Ok(sent),
             }
         };
 
-        let (mut delivery, wait_receipt) = match delivery_result {
-            Ok(d) => d,
-            Err(e) => {
-                self.drop_handles();
-                return Err(e);
-            }
-        };
-
-        if wait_receipt {
-            while let Some(res) = delivery.next().await {
-                if let Err(e) = res {
-                    self.drop_handles();
-                    return Err(SinkError::Transient(format!(
-                        "Pulsar delivery failed: {e}"
-                    )));
-                }
-            }
-        } else {
-            // Fire-and-forget: drop pending receipt futures without awaiting.
-            drop(delivery);
+        if let Err(e) = delivery_result {
+            self.drop_handles();
+            return Err(e);
         }
 
         debug!(
@@ -480,7 +439,7 @@ mod tests {
     use common::LsnRange;
     use std::sync::Arc;
 
-    fn sample_batch(order_id: i64, region: &str) -> RecordBatch {
+    fn sample_batch(order_id: i64, region: &str) -> Result<RecordBatch, String> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("order_id", DataType::Int64, false),
             Field::new("region", DataType::Utf8, true),
@@ -494,7 +453,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![order_id * 10])),
             ],
         )
-        .unwrap()
+        .map_err(|e| e.to_string())
     }
 
     fn minimal_options() -> PulsarSinkOptions {
@@ -508,51 +467,70 @@ mod tests {
 
     #[test]
     fn payload_format_parses_json_only() {
-        assert_eq!(
-            PayloadFormat::from_str_name("json").unwrap(),
-            PayloadFormat::Json
-        );
+        assert!(matches!(
+            PayloadFormat::from_str_name("json"),
+            Ok(PayloadFormat::Json)
+        ));
         assert!(PayloadFormat::from_str_name("avro").is_err());
     }
 
     #[test]
-    fn json_encoder_emits_keyed_records() {
+    fn json_encoder_emits_keyed_records() -> Result<(), String> {
         let mut options = minimal_options();
         options.key_format = Some("json".into());
         options.key_fields = vec!["order_id".into()];
         options.key_fields_prefix = "k_".into();
-        let records = encode_records(&PayloadFormat::Json, &[sample_batch(7, "east")], &options)
-            .unwrap();
+        let records = encode_records(&PayloadFormat::Json, &[sample_batch(7, "east")?], &options)
+            .map_err(|e| e.to_string())?;
         assert_eq!(records.len(), 1);
-        let key = records[0].key.as_ref().unwrap();
+        let key = records[0]
+            .key
+            .as_ref()
+            .ok_or_else(|| "expected key".to_string())?;
         assert!(key.contains("\"k_order_id\":7"), "{key}");
-        let val = String::from_utf8(records[0].value.clone()).unwrap();
+        let val = String::from_utf8(records[0].value.clone()).map_err(|e| e.to_string())?;
         assert!(val.contains("\"order_id\":7"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn write_without_begin_is_fatal() {
+    async fn write_without_begin_is_fatal() -> Result<(), String> {
         let mut sink = PulsarSink::new(PayloadFormat::Json, minimal_options());
-        let ev = DataEvent::insert(LsnRange::single(1), vec![sample_batch(1, "e")]);
-        let err = sink.write(&ev).await.unwrap_err();
+        let ev = DataEvent::insert(LsnRange::single(1), vec![sample_batch(1, "e")?]);
+        let err = sink
+            .write(&ev)
+            .await
+            .err()
+            .ok_or_else(|| "expected write error".to_string())?;
         assert!(err.is_fatal());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn preflight_fails_fast_on_unreachable_broker() {
+    async fn preflight_fails_fast_on_unreachable_broker() -> Result<(), String> {
         let mut sink = PulsarSink::new(PayloadFormat::Json, minimal_options());
-        let err = sink.begin_txn().await.unwrap_err();
-        assert!(!err.is_fatal(), "unreachable broker should be transient: {err}");
+        let err = sink
+            .begin_txn()
+            .await
+            .err()
+            .ok_or_else(|| "expected begin_txn error".to_string())?;
+        assert!(
+            !err.is_fatal(),
+            "unreachable broker should be transient: {err}"
+        );
         assert!(sink.producer.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn watermark_write_is_rejected() {
+    async fn watermark_write_is_rejected() -> Result<(), String> {
         let mut sink = PulsarSink::new(PayloadFormat::Json, minimal_options());
         let err = sink
             .write(&DataEvent::Watermark { end_lsn: 1 })
             .await
-            .unwrap_err();
+            .err()
+            .ok_or_else(|| "expected watermark error".to_string())?;
         assert!(err.is_fatal());
+        Ok(())
     }
 }

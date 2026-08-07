@@ -91,6 +91,8 @@ pub enum ConnectorType {
     Iceberg,
     /// Apache Pulsar topic (`sink.pulsar.*`).
     Pulsar,
+    /// MQTT broker topic (`sink.mqtt.*`).
+    Mqtt,
 }
 
 impl ConnectorType {
@@ -101,8 +103,9 @@ impl ConnectorType {
             "filesystem" | "fs" | "file" => Ok(Self::Filesystem),
             "iceberg" => Ok(Self::Iceberg),
             "pulsar" => Ok(Self::Pulsar),
+            "mqtt" => Ok(Self::Mqtt),
             other => Err(TsdbError::Query(format!(
-                "unsupported sink.type: {other} (supported: delta | kafka | filesystem | iceberg | pulsar)"
+                "unsupported sink.type: {other} (supported: delta | kafka | filesystem | iceberg | pulsar | mqtt)"
             ))),
         }
     }
@@ -114,6 +117,7 @@ impl ConnectorType {
             Self::Filesystem => "filesystem",
             Self::Iceberg => "iceberg",
             Self::Pulsar => "pulsar",
+            Self::Mqtt => "mqtt",
         }
     }
 }

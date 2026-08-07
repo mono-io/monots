@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Docker Compose helpers for Kafka / MinIO / Iceberg REST / Pulsar integration tests.
+//! Docker Compose helpers for Kafka / MinIO / Iceberg REST / Pulsar / MQTT integration tests.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,6 +37,8 @@ pub const ICEBERG_REST_WAREHOUSE_PREFIX: &str = "iceberg-rest-warehouse";
 pub const PULSAR_SERVICE_URL: &str = "pulsar://127.0.0.1:16650";
 /// Pulsar Admin HTTP API on the host.
 pub const PULSAR_ADMIN_URL: &str = "http://127.0.0.1:18080";
+/// MQTT broker URL on the host (`mosquitto` service).
+pub const MQTT_BROKER_URL: &str = "tcp://127.0.0.1:11883";
 
 static COMPOSE_FILE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -257,20 +259,27 @@ pub async fn ensure_pulsar_up() -> Result<(), String> {
         )
         .await;
         if broker_ok && admin_ok {
-            let url = format!("{PULSAR_ADMIN_URL}/admin/v2/brokers/health");
-            match reqwest::get(&url).await {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
-                Ok(resp) => {
-                    if Instant::now() > deadline {
-                        return Err(format!(
-                            "Pulsar admin health returned HTTP {}",
-                            resp.status()
-                        ));
-                    }
+            let health_url = format!("{PULSAR_ADMIN_URL}/admin/v2/brokers/health");
+            let ns_url = format!("{PULSAR_ADMIN_URL}/admin/v2/namespaces/public/default");
+            let health = reqwest::get(&health_url).await;
+            let ns = reqwest::get(&ns_url).await;
+            match (&health, &ns) {
+                (Ok(h), Ok(n)) if h.status().is_success() && n.status().is_success() => {
+                    return Ok(());
                 }
-                Err(e) => {
+                _ => {
                     if Instant::now() > deadline {
-                        return Err(format!("GET {url} failed: {e}"));
+                        let h_status = health
+                            .as_ref()
+                            .map(|r| r.status().to_string())
+                            .unwrap_or_else(|e| e.to_string());
+                        let n_status = ns
+                            .as_ref()
+                            .map(|r| r.status().to_string())
+                            .unwrap_or_else(|e| e.to_string());
+                        return Err(format!(
+                            "Pulsar not ready within 180s (health={h_status} namespace={n_status})"
+                        ));
                     }
                 }
             }
@@ -287,4 +296,31 @@ pub async fn ensure_pulsar_up() -> Result<(), String> {
 /// Fail hard unless Pulsar standalone is up.
 pub async fn require_pulsar() -> Result<(), String> {
     ensure_pulsar_up().await
+}
+
+/// Bring up Mosquitto and wait until the MQTT TCP port accepts connections.
+pub async fn ensure_mqtt_up() -> Result<(), String> {
+    compose_run(&["up", "-d", "mosquitto"])?;
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let ok = wait_for_port(
+            "127.0.0.1:11883",
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+        )
+        .await;
+        if ok {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err("Mosquitto MQTT broker not ready within 60s on 127.0.0.1:11883".into());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Fail hard unless Mosquitto is up.
+pub async fn require_mqtt() -> Result<(), String> {
+    ensure_mqtt_up().await
 }

@@ -44,3 +44,6 @@ path = "tests/query_large_count.rs"
 [[test]]
 name = "write_batch_sort"
 path = "tests/write_batch_sort.rs"
+
+[lints]
+workspace = true

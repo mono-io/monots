@@ -30,9 +30,9 @@ env:
 
 jobs:
   unit-test:
-    name: license · fmt · cargo test
+    name: license · fmt · clippy · cargo test
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,7 +52,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.94.1
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       # Cache ~/.cargo + target/ (deps + compile artifacts).
       # PRs restore from main; only main/master writes a new cache entry.
@@ -71,6 +71,9 @@ jobs:
 
       - name: Check Rust formatting
         run: make fmt-check
+
+      - name: Clippy gate (correctness + suspicious + dead_code)
+        run: make clippy
 
       - name: Run unit tests
         run: make test

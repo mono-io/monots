@@ -14,15 +14,13 @@
 
 //! Pulsar sink options (`sink.pulsar.*`).
 //!
-//! DDL mirrors the Flink Pulsar connector (prefixed with `sink.pulsar.`):
+//! Supported:
 //! - required: `topic`, `service-url`, `admin-url`
-//! - delivery: `delivery-guarantee`, `transaction-timeout`
-//! - routing: `message-router`, `custom-message-router`
-//! - keys: `key.format` / `key.fields` / `key.fields-prefix`
-//! - auth: `auth-plugin`, `auth-params`
+//! - delivery: `delivery-guarantee` (`none` | `at-least-once`)
+//! - keys: `key.format` / `key.fields` / `key.fields-prefix` → Pulsar `partition_key`
+//! - auth: Token via `auth-plugin` / `auth-params`
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use common::{Result, TsdbError};
 
@@ -31,9 +29,6 @@ pub const PULSAR_OPTION_PREFIX: &str = "sink.pulsar";
 /// Optional Pulsar DDL keys (excludes required topic / service-url / admin-url).
 pub const PULSAR_OPTION_KEYS: &[&str] = &[
     "sink.pulsar.delivery-guarantee",
-    "sink.pulsar.transaction-timeout",
-    "sink.pulsar.message-router",
-    "sink.pulsar.custom-message-router",
     "sink.pulsar.key.format",
     "sink.pulsar.key.fields",
     "sink.pulsar.key.fields-prefix",
@@ -48,8 +43,6 @@ pub enum PulsarDeliveryGuarantee {
     /// Wait for broker send receipt (default).
     #[default]
     AtLeastOnce,
-    /// Pulsar transactions (Flink EOS). Not available in the Rust client yet.
-    ExactlyOnce,
 }
 
 impl PulsarDeliveryGuarantee {
@@ -57,10 +50,13 @@ impl PulsarDeliveryGuarantee {
         match raw.trim().to_ascii_lowercase().as_str() {
             "none" => Ok(Self::None),
             "at-least-once" | "at_least_once" | "alo" => Ok(Self::AtLeastOnce),
-            "exactly-once" | "exactly_once" | "eos" => Ok(Self::ExactlyOnce),
+            "exactly-once" | "exactly_once" | "eos" => Err(TsdbError::Query(
+                "sink.pulsar.delivery-guarantee = exactly-once is not supported \
+                 (Rust Pulsar client has no Transaction API; use none | at-least-once)"
+                    .into(),
+            )),
             other => Err(TsdbError::Query(format!(
-                "invalid sink.pulsar.delivery-guarantee: {other} \
-                 (use none | at-least-once | exactly-once)"
+                "invalid sink.pulsar.delivery-guarantee: {other} (use none | at-least-once)"
             ))),
         }
     }
@@ -69,42 +65,6 @@ impl PulsarDeliveryGuarantee {
         match self {
             Self::None => "none",
             Self::AtLeastOnce => "at-least-once",
-            Self::ExactlyOnce => "exactly-once",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PulsarMessageRouter {
-    #[default]
-    RoundRobin,
-    Single,
-    KeyHash,
-}
-
-impl PulsarMessageRouter {
-    pub fn parse(raw: &str) -> Result<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "round-robin" | "round_robin" => Ok(Self::RoundRobin),
-            "single" => Ok(Self::Single),
-            "key-hash" | "key_hash" => Ok(Self::KeyHash),
-            "custom" => Err(TsdbError::Query(
-                "sink.pulsar.message-router = custom is not supported \
-                 (Java router classes cannot run in MonoTS; use round-robin | single | key-hash)"
-                    .into(),
-            )),
-            other => Err(TsdbError::Query(format!(
-                "invalid sink.pulsar.message-router: {other} \
-                 (use round-robin | single | key-hash)"
-            ))),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::RoundRobin => "round-robin",
-            Self::Single => "single",
-            Self::KeyHash => "key-hash",
         }
     }
 }
@@ -115,9 +75,6 @@ pub struct PulsarSinkOptions {
     pub service_url: String,
     pub admin_url: String,
     pub delivery_guarantee: PulsarDeliveryGuarantee,
-    /// Flink-style duration (`3 h`, `15m`) or milliseconds as a bare integer.
-    pub transaction_timeout: Option<Duration>,
-    pub message_router: PulsarMessageRouter,
     pub key_format: Option<String>,
     pub key_fields: Vec<String>,
     pub key_fields_prefix: String,
@@ -132,8 +89,6 @@ impl Default for PulsarSinkOptions {
             service_url: String::new(),
             admin_url: String::new(),
             delivery_guarantee: PulsarDeliveryGuarantee::AtLeastOnce,
-            transaction_timeout: None,
-            message_router: PulsarMessageRouter::RoundRobin,
             key_format: None,
             key_fields: Vec::new(),
             key_fields_prefix: String::new(),
@@ -160,19 +115,6 @@ impl PulsarSinkOptions {
 
         if let Some(v) = non_empty(options, "sink.pulsar.delivery-guarantee") {
             opts.delivery_guarantee = PulsarDeliveryGuarantee::parse(v)?;
-        }
-        if let Some(v) = non_empty(options, "sink.pulsar.transaction-timeout") {
-            opts.transaction_timeout = Some(parse_duration(v, "sink.pulsar.transaction-timeout")?);
-        }
-        if let Some(v) = non_empty(options, "sink.pulsar.message-router") {
-            opts.message_router = PulsarMessageRouter::parse(v)?;
-        }
-        if non_empty(options, "sink.pulsar.custom-message-router").is_some() {
-            return Err(TsdbError::Query(
-                "sink.pulsar.custom-message-router is not supported \
-                 (Java router classes cannot run in MonoTS)"
-                    .into(),
-            ));
         }
         if let Some(v) = non_empty(options, "sink.pulsar.key.format") {
             let fmt = v.to_ascii_lowercase();
@@ -232,19 +174,6 @@ impl PulsarSinkOptions {
                 ));
             }
         }
-        if self.message_router == PulsarMessageRouter::KeyHash && self.key_fields.is_empty() {
-            return Err(TsdbError::Query(
-                "sink.pulsar.message-router = key-hash requires sink.pulsar.key.fields".into(),
-            ));
-        }
-        if self.delivery_guarantee == PulsarDeliveryGuarantee::ExactlyOnce {
-            return Err(TsdbError::Query(
-                "sink.pulsar.delivery-guarantee = exactly-once is not available yet: \
-                 the Rust Pulsar client has no Transaction API \
-                 (use at-least-once or none; Flink EOS requires transactionCoordinatorEnabled)"
-                    .into(),
-            ));
-        }
         if let Some(plugin) = &self.auth_plugin {
             let _ = resolve_auth_kind(plugin, self.auth_params.as_deref())?;
         } else if self.auth_params.is_some() {
@@ -282,16 +211,6 @@ impl PulsarSinkOptions {
             "sink.pulsar.delivery-guarantee".into(),
             self.delivery_guarantee.as_str().into(),
         );
-        if let Some(d) = self.transaction_timeout {
-            m.insert(
-                "sink.pulsar.transaction-timeout".into(),
-                format_duration_ms(d),
-            );
-        }
-        m.insert(
-            "sink.pulsar.message-router".into(),
-            self.message_router.as_str().into(),
-        );
         if let Some(v) = &self.key_format {
             m.insert("sink.pulsar.key.format".into(), v.clone());
         }
@@ -322,17 +241,7 @@ impl PulsarSinkOptions {
                 "sink.pulsar.delivery-guarantee".into(),
                 self.delivery_guarantee.as_str().into(),
             ),
-            (
-                "sink.pulsar.message-router".into(),
-                self.message_router.as_str().into(),
-            ),
         ];
-        if let Some(d) = self.transaction_timeout {
-            pairs.push((
-                "sink.pulsar.transaction-timeout".into(),
-                format_duration_ms(d),
-            ));
-        }
         if let Some(v) = &self.key_format {
             pairs.push(("sink.pulsar.key.format".into(), v.clone()));
         }
@@ -383,7 +292,6 @@ fn parse_token_params(raw: &str) -> String {
     if let Some(rest) = trimmed.strip_prefix("token:") {
         return rest.trim().to_string();
     }
-    // Flink sometimes uses `token:xxx` or JSON `{"token":"..."}`.
     if trimmed.starts_with('{') {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
             if let Some(t) = v.get("token").and_then(|x| x.as_str()) {
@@ -435,71 +343,6 @@ fn non_empty<'a>(options: &'a HashMap<String, String>, key: &str) -> Option<&'a 
         .filter(|s| !s.is_empty())
 }
 
-fn format_duration_ms(d: Duration) -> String {
-    format!("{}ms", d.as_millis())
-}
-
-/// Parse Flink-style durations (`3 h`, `15m`, `30s`) or a bare millisecond integer.
-pub fn parse_duration(raw: &str, key: &str) -> Result<Duration> {
-    let s = raw.trim().to_ascii_lowercase();
-    if s.is_empty() {
-        return Err(TsdbError::Query(format!("empty duration for {key}")));
-    }
-    // Bare integer → milliseconds (Kafka-style).
-    if s.chars().all(|c| c.is_ascii_digit()) {
-        let ms: u64 = s
-            .parse()
-            .map_err(|_| TsdbError::Query(format!("invalid duration for {key}: {raw}")))?;
-        return Ok(Duration::from_millis(ms));
-    }
-
-    let (num_str, unit) = split_duration(&s).ok_or_else(|| {
-        TsdbError::Query(format!(
-            "invalid sink.pulsar.transaction-timeout: {raw} \
-             (use e.g. '3 h', '15m', '30s', or milliseconds)"
-        ))
-    })?;
-    let num: f64 = num_str
-        .parse()
-        .map_err(|_| TsdbError::Query(format!("invalid duration number for {key}: {raw}")))?;
-    if num < 0.0 {
-        return Err(TsdbError::Query(format!(
-            "duration for {key} must be non-negative"
-        )));
-    }
-    let secs = match unit {
-        "ms" | "millis" | "millisecond" | "milliseconds" => num / 1000.0,
-        "s" | "sec" | "secs" | "second" | "seconds" => num,
-        "m" | "min" | "mins" | "minute" | "minutes" => num * 60.0,
-        "h" | "hr" | "hrs" | "hour" | "hours" => num * 3600.0,
-        "d" | "day" | "days" => num * 86400.0,
-        other => {
-            return Err(TsdbError::Query(format!(
-                "unknown duration unit `{other}` for {key}"
-            )))
-        }
-    };
-    Ok(Duration::from_secs_f64(secs))
-}
-
-fn split_duration(s: &str) -> Option<(&str, &str)> {
-    let s = s.trim();
-    let digit_end = s
-        .char_indices()
-        .find(|(_, c)| !(c.is_ascii_digit() || *c == '.'))
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    if digit_end == 0 {
-        return None;
-    }
-    let num = s[..digit_end].trim();
-    let unit = s[digit_end..].trim();
-    if num.is_empty() || unit.is_empty() {
-        return None;
-    }
-    Some((num, unit))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,19 +363,16 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(o.delivery_guarantee, PulsarDeliveryGuarantee::AtLeastOnce);
-        assert_eq!(o.message_router, PulsarMessageRouter::RoundRobin);
         assert!(!o.has_key());
     }
 
     #[test]
-    fn parses_flink_style_options() {
+    fn parses_supported_options() {
         let o = PulsarSinkOptions::from_ddl(&opts(&[
             ("sink.pulsar.topic", "persistent://public/default/t"),
             ("sink.pulsar.service-url", "pulsar://localhost:6650"),
             ("sink.pulsar.admin-url", "http://localhost:8080"),
             ("sink.pulsar.delivery-guarantee", "none"),
-            ("sink.pulsar.transaction-timeout", "3 h"),
-            ("sink.pulsar.message-router", "key-hash"),
             ("sink.pulsar.key.format", "json"),
             ("sink.pulsar.key.fields", "order_id"),
             ("sink.pulsar.key.fields-prefix", "k_"),
@@ -544,8 +384,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(o.delivery_guarantee, PulsarDeliveryGuarantee::None);
-        assert_eq!(o.transaction_timeout, Some(Duration::from_secs(3 * 3600)));
-        assert_eq!(o.message_router, PulsarMessageRouter::KeyHash);
+        assert_eq!(o.key_fields, vec!["order_id".to_string()]);
         assert_eq!(o.auth_token().unwrap().as_deref(), Some("abc.def"));
     }
 
@@ -562,27 +401,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_custom_router() {
+    fn rejects_unsupported_router_keys() {
         let err = PulsarSinkOptions::from_ddl(&opts(&[
             ("sink.pulsar.topic", "t"),
             ("sink.pulsar.service-url", "pulsar://localhost:6650"),
             ("sink.pulsar.admin-url", "http://localhost:8080"),
-            ("sink.pulsar.message-router", "custom"),
+            ("sink.pulsar.message-router", "round-robin"),
         ]))
         .unwrap_err();
-        assert!(err.to_string().contains("custom"), "{err}");
-    }
-
-    #[test]
-    fn parse_duration_variants() {
-        assert_eq!(
-            parse_duration("15m", "k").unwrap(),
-            Duration::from_secs(900)
-        );
-        assert_eq!(
-            parse_duration("900000", "k").unwrap(),
-            Duration::from_millis(900_000)
-        );
-        assert_eq!(parse_duration("30 s", "k").unwrap(), Duration::from_secs(30));
+        assert!(err.to_string().contains("message-router"), "{err}");
     }
 }

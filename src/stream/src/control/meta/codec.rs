@@ -191,6 +191,10 @@ impl TryFrom<proto::stream::StreamDef> for StreamDef {
                 format: pb.delivery_format,
                 options: crate::model::PulsarSinkOptions::from_properties(&pb.properties)?,
             },
+            ConnectorType::Mqtt => SinkConfig::Mqtt {
+                format: pb.delivery_format,
+                options: crate::model::MqttSinkOptions::from_properties(&pb.properties)?,
+            },
         };
         Ok(Self {
             name: pb.name,
@@ -226,6 +230,7 @@ impl From<&StreamDef> for proto::stream::StreamDef {
                 crate::model::SinkConfig::Kafka { options, .. } => options.to_properties(),
                 crate::model::SinkConfig::Iceberg { options } => options.to_properties(),
                 crate::model::SinkConfig::Pulsar { options, .. } => options.to_properties(),
+                crate::model::SinkConfig::Mqtt { options, .. } => options.to_properties(),
             },
             created_at_ms: def.created_at_ms,
             sink_endpoint: def.sink_endpoint().map(|s| s.to_string()),
@@ -320,6 +325,7 @@ fn connector_to_pb(c: ConnectorType) -> proto::stream::ConnectorType {
         ConnectorType::Filesystem => proto::stream::ConnectorType::Filesystem,
         ConnectorType::Iceberg => proto::stream::ConnectorType::IcebergV1,
         ConnectorType::Pulsar => proto::stream::ConnectorType::Pulsar,
+        ConnectorType::Mqtt => proto::stream::ConnectorType::Mqtt,
     }
 }
 
@@ -330,6 +336,7 @@ fn connector_from_pb(v: i32) -> Result<ConnectorType, TsdbError> {
         Ok(proto::stream::ConnectorType::Filesystem) => Ok(ConnectorType::Filesystem),
         Ok(proto::stream::ConnectorType::IcebergV1) => Ok(ConnectorType::Iceberg),
         Ok(proto::stream::ConnectorType::Pulsar) => Ok(ConnectorType::Pulsar),
+        Ok(proto::stream::ConnectorType::Mqtt) => Ok(ConnectorType::Mqtt),
         Ok(proto::stream::ConnectorType::Unspecified) | Err(_) => Err(TsdbError::Storage(format!(
             "unsupported connector_type={v} in stream protobuf"
         ))),

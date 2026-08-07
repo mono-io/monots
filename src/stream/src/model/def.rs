@@ -19,6 +19,7 @@ use common::{ConnectorType, Result, StreamCaptureMode, TsdbError};
 use super::delta_options::{DeltaSinkOptions, DELTA_OPTION_KEYS, FILESYSTEM_OPTION_KEYS};
 use super::iceberg_options::{IcebergSinkOptions, ICEBERG_OPTION_KEYS};
 use super::kafka_options::{KafkaSinkOptions, KAFKA_OPTION_KEYS};
+use super::mqtt_options::{MqttSinkOptions, MQTT_CORE_KEYS, MQTT_OPTION_KEYS};
 use super::pulsar_options::{PulsarSinkOptions, PULSAR_OPTION_KEYS};
 
 /// Pure stream configuration (persisted in `streams/*.pb`).
@@ -33,7 +34,7 @@ pub struct StreamDef {
     pub auto_end: bool,
 }
 
-/// Strongly-typed downstream sink config (Delta / Kafka / Filesystem / Iceberg / Pulsar).
+/// Strongly-typed downstream sink config (Delta / Kafka / Filesystem / Iceberg / Pulsar / MQTT).
 #[derive(Debug, Clone)]
 pub enum SinkConfig {
     Kafka {
@@ -62,6 +63,11 @@ pub enum SinkConfig {
         format: String,
         options: PulsarSinkOptions,
     },
+    /// MQTT broker topic (`sink.mqtt.*`).
+    Mqtt {
+        format: String,
+        options: MqttSinkOptions,
+    },
 }
 
 impl SinkConfig {
@@ -72,12 +78,15 @@ impl SinkConfig {
             Self::Filesystem { .. } => ConnectorType::Filesystem,
             Self::Iceberg { .. } => ConnectorType::Iceberg,
             Self::Pulsar { .. } => ConnectorType::Pulsar,
+            Self::Mqtt { .. } => ConnectorType::Mqtt,
         }
     }
 
     pub fn delivery_format(&self) -> &str {
         match self {
-            Self::Kafka { format, .. } | Self::Pulsar { format, .. } => format.as_str(),
+            Self::Kafka { format, .. }
+            | Self::Pulsar { format, .. }
+            | Self::Mqtt { format, .. } => format.as_str(),
             Self::Delta { .. } | Self::Filesystem { .. } | Self::Iceberg { .. } => "parquet",
         }
     }
@@ -86,7 +95,7 @@ impl SinkConfig {
         match self {
             Self::Delta { path, .. } | Self::Filesystem { path, .. } => Some(path.as_str()),
             Self::Iceberg { options } => options.warehouse.as_deref(),
-            Self::Kafka { .. } | Self::Pulsar { .. } => None,
+            Self::Kafka { .. } | Self::Pulsar { .. } | Self::Mqtt { .. } => None,
         }
     }
 
@@ -142,6 +151,13 @@ impl SinkConfig {
     pub fn pulsar_options(&self) -> Option<&PulsarSinkOptions> {
         match self {
             Self::Pulsar { options, .. } => Some(options),
+            _ => None,
+        }
+    }
+
+    pub fn mqtt_options(&self) -> Option<&MqttSinkOptions> {
+        match self {
+            Self::Mqtt { options, .. } => Some(options),
             _ => None,
         }
     }
@@ -269,7 +285,7 @@ fn reject_legacy_keys(options: &HashMap<String, String>) -> Result<()> {
         return Ok(());
     }
     Err(TsdbError::Query(format!(
-        "unsupported options {} (use sink.delta.|sink.filesystem.|sink.kafka.|sink.iceberg.|sink.pulsar. prefixed keys)",
+        "unsupported options {} (use sink.delta.|sink.filesystem.|sink.kafka.|sink.iceberg.|sink.pulsar.|sink.mqtt. prefixed keys)",
         present.join(", ")
     )))
 }
@@ -316,6 +332,8 @@ fn reject_foreign_sink_keys(
             push_if(ICEBERG_OPTION_KEYS);
             push_if(&pulsar_keys);
             push_if(PULSAR_OPTION_KEYS);
+            push_if(MQTT_CORE_KEYS);
+            push_if(MQTT_OPTION_KEYS);
         }
         ConnectorType::Filesystem => {
             push_if(&delta_keys);
@@ -326,6 +344,8 @@ fn reject_foreign_sink_keys(
             push_if(ICEBERG_OPTION_KEYS);
             push_if(&pulsar_keys);
             push_if(PULSAR_OPTION_KEYS);
+            push_if(MQTT_CORE_KEYS);
+            push_if(MQTT_OPTION_KEYS);
         }
         ConnectorType::Kafka => {
             push_if(&delta_keys);
@@ -336,6 +356,8 @@ fn reject_foreign_sink_keys(
             push_if(ICEBERG_OPTION_KEYS);
             push_if(&pulsar_keys);
             push_if(PULSAR_OPTION_KEYS);
+            push_if(MQTT_CORE_KEYS);
+            push_if(MQTT_OPTION_KEYS);
         }
         ConnectorType::Iceberg => {
             push_if(&delta_keys);
@@ -346,6 +368,8 @@ fn reject_foreign_sink_keys(
             push_if(KAFKA_OPTION_KEYS);
             push_if(&pulsar_keys);
             push_if(PULSAR_OPTION_KEYS);
+            push_if(MQTT_CORE_KEYS);
+            push_if(MQTT_OPTION_KEYS);
         }
         ConnectorType::Pulsar => {
             push_if(&delta_keys);
@@ -356,6 +380,20 @@ fn reject_foreign_sink_keys(
             push_if(KAFKA_OPTION_KEYS);
             push_if(&iceberg_core);
             push_if(ICEBERG_OPTION_KEYS);
+            push_if(MQTT_CORE_KEYS);
+            push_if(MQTT_OPTION_KEYS);
+        }
+        ConnectorType::Mqtt => {
+            push_if(&delta_keys);
+            push_if(DELTA_OPTION_KEYS);
+            push_if(&fs_keys);
+            push_if(FILESYSTEM_OPTION_KEYS);
+            push_if(&kafka_keys);
+            push_if(KAFKA_OPTION_KEYS);
+            push_if(&iceberg_core);
+            push_if(ICEBERG_OPTION_KEYS);
+            push_if(&pulsar_keys);
+            push_if(PULSAR_OPTION_KEYS);
         }
     }
 
@@ -469,6 +507,10 @@ pub fn parse_stream_def(
         ConnectorType::Pulsar => SinkConfig::Pulsar {
             format: delivery_format,
             options: PulsarSinkOptions::from_ddl(options)?,
+        },
+        ConnectorType::Mqtt => SinkConfig::Mqtt {
+            format: delivery_format,
+            options: MqttSinkOptions::from_ddl(options)?,
         },
     };
 

@@ -21,10 +21,12 @@ pub mod delta;
 pub mod filesystem;
 pub mod iceberg;
 pub mod kafka;
+pub mod mqtt;
 pub mod pulsar;
 
 pub use delta::DeltaSink;
 pub use filesystem::FilesystemSink;
 pub use iceberg::IcebergSink;
 pub use kafka::{KafkaSink, PayloadFormat};
+pub use mqtt::MqttSink;
 pub use pulsar::PulsarSink;

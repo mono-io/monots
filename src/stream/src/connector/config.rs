@@ -51,6 +51,10 @@ pub enum ResolvedSinkConfig {
         format: String,
         options: crate::model::PulsarSinkOptions,
     },
+    Mqtt {
+        format: String,
+        options: crate::model::MqttSinkOptions,
+    },
 }
 
 impl ResolvedSinkConfig {
@@ -145,6 +149,24 @@ impl ResolvedSinkConfig {
                 }
                 Ok(Self::Pulsar { format, options })
             }
+            ConnectorType::Mqtt => {
+                let (format, options) = match &def.sink_config {
+                    crate::model::SinkConfig::Mqtt { format, options } => {
+                        (format.clone(), options.clone())
+                    }
+                    _ => {
+                        return Err(TsdbError::Query(
+                            "mqtt sink requires sink.mqtt.* options".into(),
+                        ))
+                    }
+                };
+                if options.url.is_empty() || options.topic.is_empty() {
+                    return Err(TsdbError::Query(
+                        "MQTT requires sink.mqtt.url (or server-uri) and sink.mqtt.topic".into(),
+                    ));
+                }
+                Ok(Self::Mqtt { format, options })
+            }
         }
     }
 }
@@ -154,7 +176,9 @@ impl ResolvedSinkConfig {
 /// Kafka / Pulsar default to hybrid (batch backfill + WAL tail); filesystem / delta / iceberg default to batch.
 pub fn connector_capture_mode(connector: ConnectorType) -> StreamCaptureMode {
     match connector {
-        ConnectorType::Kafka | ConnectorType::Pulsar => StreamCaptureMode::Hybrid,
+        ConnectorType::Kafka | ConnectorType::Pulsar | ConnectorType::Mqtt => {
+            StreamCaptureMode::Hybrid
+        }
         ConnectorType::Delta | ConnectorType::Filesystem | ConnectorType::Iceberg => {
             StreamCaptureMode::Batch
         }
@@ -163,14 +187,14 @@ pub fn connector_capture_mode(connector: ConnectorType) -> StreamCaptureMode {
 
 pub fn connector_default_format(connector: ConnectorType) -> &'static str {
     match connector {
-        ConnectorType::Kafka | ConnectorType::Pulsar => "json",
+        ConnectorType::Kafka | ConnectorType::Pulsar | ConnectorType::Mqtt => "json",
         ConnectorType::Delta | ConnectorType::Filesystem | ConnectorType::Iceberg => "parquet",
     }
 }
 
 fn supported_formats(connector: ConnectorType) -> &'static [&'static str] {
     match connector {
-        ConnectorType::Kafka | ConnectorType::Pulsar => &["json"],
+        ConnectorType::Kafka | ConnectorType::Pulsar | ConnectorType::Mqtt => &["json"],
         ConnectorType::Delta | ConnectorType::Filesystem | ConnectorType::Iceberg => &["parquet"],
     }
 }
@@ -244,6 +268,15 @@ mod tests {
                     options: crate::model::PulsarSinkOptions::from_ddl(&with).unwrap(),
                 }
             }
+            ConnectorType::Mqtt => {
+                let mut with = std::collections::HashMap::new();
+                with.insert("sink.mqtt.url".into(), "tcp://127.0.0.1:1883".into());
+                with.insert("sink.mqtt.topic".into(), "monots/cdc".into());
+                SinkConfig::Mqtt {
+                    format: "json".into(),
+                    options: crate::model::MqttSinkOptions::from_ddl(&with).unwrap(),
+                }
+            }
         };
         StreamDef {
             name: "s".into(),
@@ -266,6 +299,10 @@ mod tests {
             StreamCaptureMode::Hybrid
         );
         assert_eq!(
+            connector_capture_mode(ConnectorType::Mqtt),
+            StreamCaptureMode::Hybrid
+        );
+        assert_eq!(
             connector_capture_mode(ConnectorType::Delta),
             StreamCaptureMode::Batch
         );
@@ -276,6 +313,7 @@ mod tests {
         validate_sink(&minimal_def(ConnectorType::Kafka)).unwrap();
         validate_sink(&minimal_def(ConnectorType::Filesystem)).unwrap();
         validate_sink(&minimal_def(ConnectorType::Pulsar)).unwrap();
+        validate_sink(&minimal_def(ConnectorType::Mqtt)).unwrap();
     }
 
     #[test]

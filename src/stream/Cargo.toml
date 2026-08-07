@@ -48,14 +48,22 @@ iceberg-catalog-rest = { version = "0.4.0", default-features = false }
 iceberg-catalog-glue = { version = "0.4.0", default-features = false }
 uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
-# Pure-Rust Pulsar client (no C++ dependency). Transactions / EOS not available yet.
-pulsar = { version = "6.8", default-features = false, features = ["tokio-runtime", "compression"] }
+# Pure-Rust Pulsar client. 6.3.1 keeps chrono ^0.4.39 (compatible with Arrow 53);
+# 6.4+ bumps chrono to ^0.4.41 which breaks arrow-arith 53.
+pulsar = { version = "6.3.1", default-features = false, features = ["tokio-runtime", "compression"] }
+chrono = { workspace = true }
+# Pure-Rust MQTT client (Flink-style sink.mqtt.*). Default features pull rustls for ssl://.
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls", "websocket"] }
 
 [dev-dependencies]
 
 [features]
-default = ["kafka", "delta", "iceberg", "pulsar"]
+default = ["kafka", "delta", "iceberg", "pulsar", "mqtt"]
 kafka = []
 delta = []
 iceberg = []
 pulsar = []
+mqtt = []
+
+[lints]
+workspace = true

@@ -51,7 +51,10 @@ arc-swap = "1.7"
 libc = "0.2"
 crc32fast = "1.4"
 lru = "0.12"
+# Pin below chrono 0.4.40: Datelike::quarter clashes with arrow-arith 53 (Arrow stack we need).
+# pulsar 6.3.1 accepts ^0.4.39; 6.4+ requires ^0.4.41 and would force the conflict.
+chrono = { version = "=0.4.39", default-features = false, features = ["clock", "std"] }
 
-# arrow-arith 53.4.0 + chrono >=0.4.40: disambiguate Datelike::quarter (see patches/).
-[patch.crates-io]
-arrow-arith = { path = "patches/arrow-arith-53.4.0" }
+[workspace.lints.rust]
+# Fail the build on unused items (keeps `make dist` / release clean).
+dead_code = "deny"

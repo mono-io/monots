@@ -385,6 +385,11 @@ pub fn format_stream_ddl(def: &StreamDef) -> String {
                 parts.push(format!("'{k}' = '{v}'"));
             }
         }
+        crate::model::SinkConfig::Mqtt { options, .. } => {
+            for (k, v) in options.ddl_pairs() {
+                parts.push(format!("'{k}' = '{v}'"));
+            }
+        }
     }
     if def.auto_end {
         parts.push(format!("'cdc.auto_end' = '{}'", def.auto_end));

@@ -24,9 +24,9 @@ pub use all_types_arrow::{
     enum_value_at, full_types_batch, full_types_columns, full_types_ddl, full_types_schema,
 };
 pub use framework::docker::{
-    require_docker_stack, require_iceberg_rest, require_pulsar, ICEBERG_REST_URI,
+    require_docker_stack, require_iceberg_rest, require_mqtt, require_pulsar, ICEBERG_REST_URI,
     ICEBERG_REST_WAREHOUSE_PREFIX, KAFKA_BOOTSTRAP, MINIO_ACCESS_KEY, MINIO_BUCKET, MINIO_ENDPOINT,
-    MINIO_SECRET_KEY, PULSAR_ADMIN_URL, PULSAR_SERVICE_URL,
+    MINIO_SECRET_KEY, MQTT_BROKER_URL, PULSAR_ADMIN_URL, PULSAR_SERVICE_URL,
 };
 pub use framework::instance::{ts_col, unique_table, MonotsInstance};
 pub use helpers::{

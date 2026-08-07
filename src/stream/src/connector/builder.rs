@@ -23,10 +23,11 @@ use crate::model::StreamDef;
 
 use super::api::SinkConnector;
 use super::config::ResolvedSinkConfig;
-use super::plugins::{
-    DeltaSink, FilesystemSink, IcebergSink, KafkaSink, PayloadFormat, PulsarSink,
-};
+use super::plugins::mqtt::PayloadFormat as MqttPayloadFormat;
 use super::plugins::pulsar::PayloadFormat as PulsarPayloadFormat;
+use super::plugins::{
+    DeltaSink, FilesystemSink, IcebergSink, KafkaSink, MqttSink, PayloadFormat, PulsarSink,
+};
 
 /// Build the physical sink for a stream definition.
 pub fn build_sink(def: &StreamDef) -> Result<Box<dyn SinkConnector>> {
@@ -90,6 +91,19 @@ pub fn build_sink_with_engine(
             let format = PulsarPayloadFormat::from_str_name(&format)
                 .map_err(|e| common::TsdbError::Query(e.to_string()))?;
             let mut sink = PulsarSink::new(format, options);
+            if let Some(engine) = engine {
+                if let Ok(loader) =
+                    StreamArrowLoader::from_engine(engine, def.source_tables[0].as_str())
+                {
+                    sink = sink.with_arrow_loader(loader);
+                }
+            }
+            Ok(Box::new(sink))
+        }
+        ResolvedSinkConfig::Mqtt { format, options } => {
+            let format = MqttPayloadFormat::from_str_name(&format)
+                .map_err(|e| common::TsdbError::Query(e.to_string()))?;
+            let mut sink = MqttSink::new(format, options);
             if let Some(engine) = engine {
                 if let Ok(loader) =
                     StreamArrowLoader::from_engine(engine, def.source_tables[0].as_str())
@@ -185,6 +199,19 @@ mod tests {
             ..kafka.clone()
         };
         let _ = build_sink(&pulsar).unwrap();
+
+        let mut mqtt_opts = std::collections::HashMap::new();
+        mqtt_opts.insert("sink.mqtt.url".into(), "tcp://127.0.0.1:1883".into());
+        mqtt_opts.insert("sink.mqtt.topic".into(), "monots/cdc".into());
+        let mqtt = StreamDef {
+            sink_config: SinkConfig::Mqtt {
+                format: "json".into(),
+                options: crate::model::MqttSinkOptions::from_ddl(&mqtt_opts).unwrap(),
+            },
+            capture_mode: common::StreamCaptureMode::Hybrid,
+            ..kafka.clone()
+        };
+        let _ = build_sink(&mqtt).unwrap();
 
         let _ = NoopSink::default();
         let _ = ConnectorType::Kafka;

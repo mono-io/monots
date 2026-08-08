@@ -301,16 +301,11 @@ fn drop_table_replay_and_budget_release() {
 fn create_schema_rejects_duplicate() {
     let dir = TempMetaDir::new("create_dup");
     let store = MetaStore::open(dir.path(), 8 * 1024 * 1024).unwrap();
-    store
-        .create_schema(table_schema("t", dir.path()))
-        .unwrap();
+    store.create_schema(table_schema("t", dir.path())).unwrap();
     let err = store
         .create_schema(table_schema("t", dir.path()))
         .unwrap_err();
-    assert!(
-        err.to_string().contains("already exists"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("already exists"), "got: {err}");
 }
 
 #[test]
@@ -340,7 +335,10 @@ fn concurrent_create_schema_only_one_wins() {
             }
         }
     }
-    assert_eq!(oks, 1, "exactly one create_schema must win, got ok={oks} err={errs}");
+    assert_eq!(
+        oks, 1,
+        "exactly one create_schema must win, got ok={oks} err={errs}"
+    );
     assert_eq!(errs, 15);
     assert_eq!(store.list_tables(), vec!["race".to_string()]);
 }

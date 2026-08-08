@@ -309,7 +309,6 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use parquet::arrow::ArrowWriter;
     use std::sync::Arc;
 
     fn catalog_schema() -> arrow::datatypes::SchemaRef {

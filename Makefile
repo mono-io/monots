@@ -136,10 +136,10 @@ check: .check-env check-license
 	@cargo check --workspace --quiet
 
 clippy: .check-env
-	$(call log,CLIPPY,cargo clippy \(correctness + suspicious + dead_code\))
+	$(call log,CLIPPY,cargo clippy \(correctness + suspicious + unused\))
 	@cargo clippy --workspace --all-targets \
 		--exclude monots-integration-tests \
-		-- -D clippy::correctness -D clippy::suspicious -D dead_code
+		-- -D clippy::correctness -D clippy::suspicious -D unused
 
 check-ci: check-license fmt-check clippy
 	$(call success,CI checks passed \(license + fmt + clippy\))

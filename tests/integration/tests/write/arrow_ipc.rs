@@ -14,7 +14,7 @@
 
 //! SDK Arrow IPC write: all types, client/server time ordering.
 
-use arrow::array::{AsArray, Decimal128Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{Decimal128Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use monots_integration_tests::{

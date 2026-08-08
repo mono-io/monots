@@ -72,7 +72,7 @@ jobs:
       - name: Check Rust formatting
         run: make fmt-check
 
-      - name: Clippy gate (correctness + suspicious + dead_code)
+      - name: Clippy gate (correctness + suspicious + unused)
         run: make clippy
 
       - name: Run unit tests

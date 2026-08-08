@@ -56,5 +56,6 @@ lru = "0.12"
 chrono = { version = "=0.4.39", default-features = false, features = ["clock", "std"] }
 
 [workspace.lints.rust]
-# Fail the build on unused items (keeps `make dist` / release clean).
+# Fail the build on unused code/imports (keeps `make dist` / CI clean).
+unused = "deny"
 dead_code = "deny"

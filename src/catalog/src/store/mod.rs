@@ -250,6 +250,43 @@ impl MetaStore {
         })
     }
 
+    /// Atomically create a table schema: fails if the name is already present.
+    ///
+    /// Unlike [`Self::put_schema`] (upsert for schema evolution), this uses a DashMap
+    /// entry insert so concurrent `CREATE TABLE` calls cannot both succeed.
+    pub fn create_schema(&self, schema: proto::meta::TableSchema) -> Result<()> {
+        validate_schema_proto(&schema)?;
+        let table = schema.table_name.clone();
+        let new_bytes = estimate_schema_bytes(&schema);
+
+        match self.schemas.entry(table.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(TsdbError::Schema(format!("table {table} already exists")));
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                if !self.budget.try_reserve(new_bytes) {
+                    return Err(TsdbError::Storage(format!(
+                        "metadata memory budget exceeded ({} bytes)",
+                        self.budget.limit_bytes()
+                    )));
+                }
+                slot.insert(schema.clone());
+                self.manifests.entry(table).or_default();
+            }
+        }
+
+        let seq = self.next_seq();
+        self.append_record(proto::meta::MetadataRecord {
+            seq,
+            timestamp_ms: now_ms(),
+            op: Some(proto::meta::metadata_record::Op::PutSchema(
+                proto::meta::PutSchema {
+                    schema: Some(schema),
+                },
+            )),
+        })
+    }
+
     pub fn set_manifest(&self, table: &str, files: Vec<SstMeta>) -> Result<()> {
         if !self.schemas.contains_key(table) {
             return Err(TsdbError::TableNotFound(table.to_string()));
@@ -329,6 +366,17 @@ impl MetaStore {
         tokio::task::spawn_blocking(move || this.put_schema(schema))
             .await
             .map_err(|e| TsdbError::Storage(format!("meta put_schema join failed: {e}")))?
+    }
+
+    /// Async variant of [`Self::create_schema`] (offloaded to the blocking pool).
+    pub async fn create_schema_async(
+        self: &Arc<Self>,
+        schema: proto::meta::TableSchema,
+    ) -> Result<()> {
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || this.create_schema(schema))
+            .await
+            .map_err(|e| TsdbError::Storage(format!("meta create_schema join failed: {e}")))?
     }
 
     /// Async variant of [`Self::set_manifest`] (offloaded to the blocking pool).

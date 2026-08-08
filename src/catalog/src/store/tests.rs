@@ -298,6 +298,54 @@ fn drop_table_replay_and_budget_release() {
 }
 
 #[test]
+fn create_schema_rejects_duplicate() {
+    let dir = TempMetaDir::new("create_dup");
+    let store = MetaStore::open(dir.path(), 8 * 1024 * 1024).unwrap();
+    store
+        .create_schema(table_schema("t", dir.path()))
+        .unwrap();
+    let err = store
+        .create_schema(table_schema("t", dir.path()))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already exists"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn concurrent_create_schema_only_one_wins() {
+    let dir = TempMetaDir::new("create_conc");
+    let store = std::sync::Arc::new(MetaStore::open(dir.path(), 8 * 1024 * 1024).unwrap());
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let store = std::sync::Arc::clone(&store);
+        let path = dir.path().to_path_buf();
+        handles.push(std::thread::spawn(move || {
+            store.create_schema(table_schema("race", &path))
+        }));
+    }
+
+    let mut oks = 0usize;
+    let mut errs = 0usize;
+    for h in handles {
+        match h.join().expect("worker thread panicked") {
+            Ok(()) => oks += 1,
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("already exists"),
+                    "unexpected error: {e}"
+                );
+                errs += 1;
+            }
+        }
+    }
+    assert_eq!(oks, 1, "exactly one create_schema must win, got ok={oks} err={errs}");
+    assert_eq!(errs, 15);
+    assert_eq!(store.list_tables(), vec!["race".to_string()]);
+}
+
+#[test]
 fn add_column_updates_schema_via_put_schema() {
     let dir = TempMetaDir::new("add_col");
     let store = MetaStore::open(dir.path(), 8 * 1024 * 1024).unwrap();

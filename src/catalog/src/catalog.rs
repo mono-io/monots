@@ -106,12 +106,16 @@ impl CatalogManager {
     }
 
     /// Create a table: I/O (dir creation + WAL write) runs off the async worker thread.
+    ///
+    /// Concurrent creates for the same name are serialized by
+    /// [`MetaStore::create_schema`]'s atomic entry insert — exactly one wins.
     pub async fn create_table(
         &self,
         table_name: &str,
         columns: Vec<ColumnDef>,
         base_data_dir: &Path,
     ) -> Result<()> {
+        // Fast path (still racy alone; atomic create_schema below is the authority).
         if self.store.get_table_meta(table_name).is_some() {
             return Err(TsdbError::Schema(format!(
                 "table {table_name} already exists"
@@ -125,7 +129,7 @@ impl CatalogManager {
 
         let schema = Self::build_arrow_schema(&columns)?;
         self.store
-            .put_schema_async(proto::meta::TableSchema {
+            .create_schema_async(proto::meta::TableSchema {
                 table_name: table_name.to_string(),
                 columns: columns
                     .iter()

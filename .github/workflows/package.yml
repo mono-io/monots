@@ -252,10 +252,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Required gate: native arches only. Embedded QEMU packages are advisory.
+  # Required gate: native arches only (do not wait on QEMU embedded builds).
   compile-ok:
     name: multi-arch compile gate
-    needs: [package-native, package-embedded]
+    needs: [package-native]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -263,18 +263,19 @@ jobs:
         run: |
           echo "event=${{ github.event_name }} ref=${{ github.ref }}"
           echo "package-native=${{ needs.package-native.result }}"
-          echo "package-embedded=${{ needs.package-embedded.result }} (advisory; QEMU)"
           test "${{ needs.package-native.result }}" = "success"
           echo "Native multi-arch builds completed successfully."
 
   release:
     name: GitHub Release (tag + assets)
-    needs: [resolve-version, compile-ok]
+    needs: [resolve-version, compile-ok, package-native, package-embedded]
     # Tag push, or manual "Run workflow" with publish_release=true.
+    # package-embedded is continue-on-error; we publish whatever dist artifacts exist.
     if: |
       always()
       && needs.resolve-version.result == 'success'
       && needs.compile-ok.result == 'success'
+      && needs.package-native.result == 'success'
       && (
         startsWith(github.ref, 'refs/tags/')
         || (github.event_name == 'workflow_dispatch' && inputs.publish_release)

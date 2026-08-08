@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Copyright 2026 MonoTS Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,11 +16,19 @@
 # CI packaging image: build monots-server + monots for the *container*
 # architecture. Used with `docker buildx --platform …` so armv7 / riscv64
 # etc. compile natively under QEMU (required for librdkafka cmake).
+#
+# Cargo registry/git/target use BuildKit cache mounts; pair with
+# `docker buildx build --cache-from/--cache-to type=gha` on GitHub Actions
+# or every CI run is a multi-hour cold QEMU compile.
 
 ARG RUST_VERSION=1.94.1
 ARG DEBIAN_VERSION=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
+
+# BuildKit sets these for --platform builds (used in cache mount ids).
+ARG TARGETARCH
+ARG TARGETVARIANT
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -37,12 +46,20 @@ WORKDIR /build
 COPY . .
 
 ENV CARGO_TERM_COLOR=always \
+    CARGO_HOME=/usr/local/cargo \
     RUSTFLAGS="-C opt-level=z -C strip=symbols"
 
-RUN cargo build --release --locked -p server -p cli \
-    && strip target/release/monots-server target/release/monots
+# Cache mounts are per-platform (arm/riscv). Binaries must be copied out of
+# the target cache mount — mounts are not part of the committed image layers.
+RUN --mount=type=cache,id=monots-cargo-registry-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=monots-cargo-git-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=monots-cargo-target-${TARGETARCH}${TARGETVARIANT},target=/build/target,sharing=locked \
+    mkdir -p /out \
+    && cargo build --release --locked -p server -p cli \
+    && strip target/release/monots-server target/release/monots \
+    && cp target/release/monots-server target/release/monots /out/
 
 # Scratch stage whose only purpose is exporting binaries via buildx --output.
 FROM scratch AS export
-COPY --from=builder /build/target/release/monots-server /monots-server
-COPY --from=builder /build/target/release/monots /monots
+COPY --from=builder /out/monots-server /monots-server
+COPY --from=builder /out/monots /monots

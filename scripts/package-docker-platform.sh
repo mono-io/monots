@@ -57,11 +57,22 @@ trap 'rm -rf "${STAGE}"' EXIT
 echo "[-] Docker package: platform=${PLATFORM} triple=${TRIPLE}"
 echo "[-] Dockerfile: ${DOCKERFILE}"
 
+CACHE_ARGS=()
+# Ephemeral GHA runners need type=gha or BuildKit cache mounts are discarded
+# after the job. Scope by triple so armv7 / riscv64 do not clobber each other.
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  SCOPE="monots-package-${TRIPLE}"
+  CACHE_ARGS+=(--cache-from "type=gha,scope=${SCOPE}")
+  CACHE_ARGS+=(--cache-to "type=gha,mode=max,scope=${SCOPE}")
+  echo "[-] Buildx GHA cache scope=${SCOPE}"
+fi
+
 docker buildx version >/dev/null
 docker buildx build \
   --platform "${PLATFORM}" \
   --file "${DOCKERFILE}" \
   "${BUILD_ARGS[@]}" \
+  "${CACHE_ARGS[@]}" \
   --target export \
   --output "type=local,dest=${STAGE}" \
   "${ROOT}"

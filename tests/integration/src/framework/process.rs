@@ -14,7 +14,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use super::workspace::InstanceWorkspace;
@@ -23,6 +23,8 @@ pub struct MonotsProcess {
     binary: std::path::PathBuf,
     workspace: InstanceWorkspace,
     child: Option<Child>,
+    /// Last observed exit status after stop/kill/wait (if any).
+    last_status: Option<ExitStatus>,
 }
 
 impl MonotsProcess {
@@ -31,6 +33,7 @@ impl MonotsProcess {
             binary,
             workspace,
             child: None,
+            last_status: None,
         }
     }
 
@@ -43,6 +46,10 @@ impl MonotsProcess {
 
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(|c| c.id())
+    }
+
+    pub fn last_status(&self) -> Option<ExitStatus> {
+        self.last_status
     }
 
     pub fn start(
@@ -61,6 +68,7 @@ impl MonotsProcess {
             return Err(format!("binary not found: {}", self.binary.display()));
         }
 
+        self.last_status = None;
         let stdout = open_log(&self.workspace.stdout_file)?;
         let stderr = open_log(&self.workspace.stderr_file)?;
 
@@ -123,7 +131,10 @@ impl MonotsProcess {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 match child.try_wait() {
-                    Ok(Some(_)) => break,
+                    Ok(Some(status)) => {
+                        self.last_status = Some(status);
+                        break;
+                    }
                     Ok(None) => {
                         if std::time::Instant::now() >= deadline {
                             #[cfg(unix)]
@@ -132,7 +143,9 @@ impl MonotsProcess {
                             }
                             #[cfg(not(unix))]
                             let _ = child.kill();
-                            let _ = child.wait();
+                            if let Ok(status) = child.wait() {
+                                self.last_status = Some(status);
+                            }
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(50));
@@ -156,7 +169,22 @@ impl MonotsProcess {
             {
                 let _ = child.kill();
             }
-            let _ = child.wait();
+            if let Ok(status) = child.wait() {
+                self.last_status = Some(status);
+            }
+        }
+    }
+
+    /// Non-destructive poll: if the child has exited, record status and clear the handle.
+    pub fn refresh_status(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.last_status = Some(status);
+                    self.child = None;
+                }
+                Ok(None) | Err(_) => {}
+            }
         }
     }
 }

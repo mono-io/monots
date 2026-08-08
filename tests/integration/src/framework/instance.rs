@@ -25,6 +25,8 @@ use super::workspace::InstanceWorkspace;
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_USER: &str = "admin";
 const DEFAULT_PASS: &str = "admin";
+/// How much of each server log to dump into CI stdout on failure.
+const FAILURE_LOG_TAIL_CHARS: usize = 64 * 1024;
 
 /// Facade for a single MonoTS server used in integration tests.
 pub struct MonotsInstance {
@@ -87,6 +89,18 @@ impl MonotsInstance {
         format!("{}:{}", self.host, self.port)
     }
 
+    pub fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace.root_dir
+    }
+
+    pub fn stderr_log_path(&self) -> &std::path::Path {
+        &self.workspace.stderr_file
+    }
+
+    pub fn stdout_log_path(&self) -> &std::path::Path {
+        &self.workspace.stdout_file
+    }
+
     pub async fn start(&mut self) -> Result<(), String> {
         self.workspace.setup()?;
         self.process.start(
@@ -100,10 +114,10 @@ impl MonotsInstance {
 
         let addr = format!("{}:{}", self.host, self.port);
         if !wait_for_port(&addr, Duration::from_secs(30), Duration::from_millis(200)).await {
-            let stderr = read_tail(&self.workspace.stderr_file, 2000);
             self.process.kill();
             return Err(format!(
-                "server did not become ready on {addr} within 30s.\nstderr tail:\n{stderr}"
+                "server did not become ready on {addr} within 30s.\n{}",
+                self.diagnostics("start-timeout")
             ));
         }
         Ok(())
@@ -149,6 +163,51 @@ impl MonotsInstance {
         self.workspace.cleanup();
     }
 
+    /// Text diagnostics (paths, exit status, log tails) for attaching to test failures.
+    pub fn diagnostics(&mut self, reason: &str) -> String {
+        self.process.refresh_status();
+        let alive = self.process.is_running();
+        let status = self
+            .process
+            .last_status()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| if alive { "running".into() } else { "unknown".into() });
+        let pid = self
+            .process
+            .pid()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".into());
+        let stderr = read_tail(&self.workspace.stderr_file, FAILURE_LOG_TAIL_CHARS);
+        let stdout = read_tail(&self.workspace.stdout_file, FAILURE_LOG_TAIL_CHARS);
+        format!(
+            "========== monots-server IT diagnostics ({reason}) ==========\n\
+             grpc={}  pid={pid}  exit/status={status}\n\
+             workspace {}\n\
+             stdout {}  (tail below)\n\
+             stderr {}  (tail below)\n\
+             ----- stdout tail -----\n{stdout}\n\
+             ----- stderr tail -----\n{stderr}\n\
+             =============================================================\n",
+            self.grpc_url(),
+            self.workspace.root_dir.display(),
+            self.workspace.stdout_file.display(),
+            self.workspace.stderr_file.display(),
+        )
+    }
+
+    /// Print diagnostics to stderr and keep the workspace for CI artifact upload.
+    pub fn emit_failure_diagnostics(&mut self, reason: &str) {
+        self.workspace.mark_failed(reason);
+        let dump = self.diagnostics(reason);
+        // eprintln so cargo/CI captures it even when the panic message is truncated.
+        eprintln!("{dump}");
+    }
+
+    /// Annotate an RPC/client error with server log context (e.g. transport errors).
+    pub fn annotate_err(&mut self, err: impl std::fmt::Display) -> String {
+        format!("{err}\n{}", self.diagnostics("client-error"))
+    }
+
     pub async fn client(&self) -> Result<Client, String> {
         Client::connect(self.grpc_url())
             .await
@@ -180,7 +239,13 @@ impl MonotsInstance {
 
 impl Drop for MonotsInstance {
     fn drop(&mut self) {
-        self.kill();
+        if std::thread::panicking() {
+            // Never discard evidence on failure: dump logs to CI output and keep the workspace.
+            self.emit_failure_diagnostics("test-panic");
+            self.process.kill();
+        } else {
+            self.kill();
+        }
     }
 }
 

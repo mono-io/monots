@@ -69,6 +69,19 @@ jobs:
       - name: Run integration tests
         run: make integration-test
 
+      - name: Upload IT failure workspaces (server logs)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: it-failure-logs-${{ github.run_id }}-${{ github.sha }}
+          path: |
+            tests/integration/target/**/FAILED
+            tests/integration/target/**/logs/**
+            tests/integration/target/**/stdout.log
+            tests/integration/target/**/stderr.log
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Tear down Docker stack
         if: always()
         run: make -C tests/integration docker-down

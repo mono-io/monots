@@ -55,8 +55,10 @@ impl InstanceWorkspace {
         for dir in [&self.data_dir, &self.log_dir, &self.conf_dir] {
             fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
         }
+        // `info` so CI failure dumps contain useful server context (errors alone are too sparse
+        // when the process is SIGKILL'd / OOMd).
         let config = r#"logging:
-  level: error
+  level: info
   file: false
   console: true
 storage:
@@ -68,10 +70,23 @@ storage:
         Ok(())
     }
 
+    /// Successful tests: remove the whole workspace (data + logs).
     pub fn cleanup(&self) {
-        if self.data_dir.exists() {
-            let _ = fs::remove_dir_all(&self.data_dir);
+        if self.root_dir.exists() {
+            let _ = fs::remove_dir_all(&self.root_dir);
         }
+    }
+
+    /// Failed tests: leave workspace on disk and stamp a marker for CI artifact upload.
+    pub fn mark_failed(&self, reason: &str) {
+        let marker = self.root_dir.join("FAILED");
+        let body = format!(
+            "reason={reason}\nroot={}\nstdout={}\nstderr={}\n",
+            self.root_dir.display(),
+            self.stdout_file.display(),
+            self.stderr_file.display()
+        );
+        let _ = fs::write(marker, body);
     }
 }
 

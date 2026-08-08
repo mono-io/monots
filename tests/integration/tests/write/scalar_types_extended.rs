@@ -222,12 +222,15 @@ async fn large_text_and_binary_roundtrip_via_sql() {
     assert_eq!(blob.value(1), &[0x01, 0x02]);
 
     // Aggregate query exercises the query path over LARGETEXT.
-    let count = client
+    let count = match client
         .query(&format!(
             "SELECT COUNT(*) AS c FROM {table} WHERE note = 'second'"
         ))
         .await
-        .unwrap();
+    {
+        Ok(rows) => rows,
+        Err(e) => panic!("{}", inst.annotate_err(e)),
+    };
     let c = count[0]
         .column_by_name("c")
         .unwrap()

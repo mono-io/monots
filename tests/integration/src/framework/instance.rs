@@ -171,7 +171,13 @@ impl MonotsInstance {
             .process
             .last_status()
             .map(|s| s.to_string())
-            .unwrap_or_else(|| if alive { "running".into() } else { "unknown".into() });
+            .unwrap_or_else(|| {
+                if alive {
+                    "running".into()
+                } else {
+                    "unknown".into()
+                }
+            });
         let pid = self
             .process
             .pid()

@@ -33,10 +33,14 @@ DOCKERFILE="${3:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+BUILD_ARGS=(--build-arg "RUST_VERSION=1.94.1")
+
 if [[ -z "${DOCKERFILE}" ]]; then
   case "${PLATFORM}" in
     linux/riscv64|linux/ppc64le|linux/s390x)
+      # Official debian:bookworm has no riscv64; trixie does.
       DOCKERFILE="${ROOT}/Dockerfile.package.debian"
+      BUILD_ARGS+=(--build-arg "DEBIAN_VERSION=trixie")
       ;;
     *)
       DOCKERFILE="${ROOT}/Dockerfile.package"
@@ -57,7 +61,7 @@ docker buildx version >/dev/null
 docker buildx build \
   --platform "${PLATFORM}" \
   --file "${DOCKERFILE}" \
-  --build-arg "RUST_VERSION=1.94.1" \
+  "${BUILD_ARGS[@]}" \
   --target export \
   --output "type=local,dest=${STAGE}" \
   "${ROOT}"

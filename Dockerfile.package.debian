@@ -15,8 +15,11 @@
 # Packaging for architectures without an official `rust` image tag
 # (e.g. linux/riscv64). Installs rustup inside Debian for the build
 # platform provided by `docker buildx --platform …`.
+#
+# Use Debian trixie (not bookworm): official `debian:bookworm` has no
+# riscv64 variant, so Buildx fails immediately with "no match for platform".
 
-ARG DEBIAN_VERSION=bookworm
+ARG DEBIAN_VERSION=trixie
 ARG RUST_VERSION=1.94.1
 
 FROM debian:${DEBIAN_VERSION} AS builder

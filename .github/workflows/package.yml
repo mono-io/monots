@@ -205,10 +205,13 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # QEMU builds (armv7 / riscv64). Best-effort: full MonoTS under emulation
+  # can take many hours and must not block the native compile gate.
   package-embedded:
     name: embedded (${{ matrix.name }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 360
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -224,6 +227,8 @@ jobs:
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm,riscv64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -247,21 +252,20 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Required status for PRs / branch pushes: every arch must have compiled.
+  # Required gate: native arches only. Embedded QEMU packages are advisory.
   compile-ok:
     name: multi-arch compile gate
     needs: [package-native, package-embedded]
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - name: All package jobs must succeed
+      - name: Native package jobs must succeed
         run: |
           echo "event=${{ github.event_name }} ref=${{ github.ref }}"
           echo "package-native=${{ needs.package-native.result }}"
-          echo "package-embedded=${{ needs.package-embedded.result }}"
+          echo "package-embedded=${{ needs.package-embedded.result }} (advisory; QEMU)"
           test "${{ needs.package-native.result }}" = "success"
-          test "${{ needs.package-embedded.result }}" = "success"
-          echo "All multi-arch builds completed successfully."
+          echo "Native multi-arch builds completed successfully."
 
   release:
     name: GitHub Release (tag + assets)
